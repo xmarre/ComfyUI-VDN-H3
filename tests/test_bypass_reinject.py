@@ -2,8 +2,8 @@
 
 The original Continuum crash was a cyclic ``module.forward`` chain. The restored
 ``lora_mode=bypass`` no longer means BypassForwardHook: it is a Comfy-owned
-``weight_function`` wrapper. These tests prove that both modes preserve clone/load/
-unload semantics and that runtime mode never installs or mutates a forward chain.
+``weight_function`` wrapper backed by an additional ModelPatcher containing only the
+low-rank A/B tensors.
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import comfy.model_patcher
 import comfy.ops
 
 from vdn_h3.apply import _RuntimeLoRAWeight, apply_adapters
+from vdn_h3.managed import RuntimeLoRATermsModel
 
 
 def _comfy_linear(dim=8):
@@ -49,8 +50,6 @@ class ConditioningDiffusion(nn.Module):
         self.use_adaln_curves = False
 
     def preprocess_text_embeds(self, x):
-        # Structural stand-in for the real crash path:
-        # preprocess_text_embeds -> token_refiner -> fc1.
         return torch.nn.functional.silu(self.token_refiner.fc1(x))
 
     def forward(self, x):
@@ -100,9 +99,19 @@ def _patched_from(base, strength=1.0, seed=20, mode="merge"):
         assert report["default"]["native_weight_patches"] == 1
     else:
         assert report["default"]["runtime_weight_targets"] == 1
-        assert report["runtime_lowvram"] == {
-            "weight_wrappers": 1, "forward_hooks": 0}
+        runtime = report["runtime_lowvram"]
+        assert runtime["weight_wrappers"] == 1
+        assert runtime["forward_hooks"] == 0
+        assert runtime["managed_adapter_bytes"] > 0
+        assert runtime["delta_buffer_limit_bytes"] > 0
     return patcher
+
+
+def _direct_runtime_wrapper(terms):
+    source = RuntimeLoRATermsModel(
+        {"linear": terms}, torch.device("cpu"))
+    return _RuntimeLoRAWeight(
+        "diffusion_model.linear.weight", "linear", source)
 
 
 def test_runtime_wrapper_matches_explicit_delta_without_mutating_input():
@@ -113,16 +122,13 @@ def test_runtime_wrapper_matches_explicit_delta_without_mutating_input():
     b1 = torch.randn(8, 3)
     a2 = torch.randn(2, 8)
     b2 = torch.randn(8, 2)
-    wrapper = _RuntimeLoRAWeight(
-        "diffusion_model.linear.weight",
-        [(a1, b1, 0.75), (a2, b2, -0.2)],
-    )
+    wrapper = _direct_runtime_wrapper(
+        [(a1, b1, 0.75), (a2, b2, -0.2)])
 
     got = wrapper(weight)
     expected = weight + 0.75 * (b1 @ a1) - 0.2 * (b2 @ a2)
     assert torch.allclose(got, expected, atol=2e-6, rtol=2e-6)
     assert torch.equal(weight, original)
-    # No device/prepared cache: shallow ModelPatcher clones may safely share it.
     assert not hasattr(wrapper, "prepared_patches")
     assert not hasattr(wrapper, "original_forward")
 
@@ -138,7 +144,21 @@ def test_runtime_mode_registers_weight_wrapper_not_injection_or_forward_patch():
     wrappers = vdn.weight_wrapper_patches["diffusion_model.linear.weight"]
     assert len(wrappers) == 1
     assert wrappers[0]._vdn_runtime_lora is True
+    assert wrappers[0].source.term_count() == 1
+    assert "vdn_runtime_lora" in vdn.additional_models
     assert module.forward.__func__ is original_forward
+
+
+def test_runtime_mode_fails_closed_without_weight_function_contract():
+    base = _base_patcher(runtime_capable=False)
+    clone = base.clone()
+    try:
+        apply_adapters(clone, _converted(), 1.0, mode="bypass", stage_path=None)
+    except RuntimeError as exc:
+        assert "weight_function" in str(exc)
+        assert "merge" in str(exc)
+    else:
+        raise AssertionError("runtime mode accepted an unsupported plain nn.Linear")
 
 
 def test_native_patch_does_not_replace_forward():
@@ -181,8 +201,6 @@ def test_repeated_runtime_clone_load_unload_is_stable_and_never_merges_base():
     for chunk in range(12):
         clone = vdn.clone()
         clone.patch_model(device_to=torch.device("cpu"))
-        # Runtime mode must leave the resident parameter untouched; only the cast
-        # weight supplied to this invocation receives the low-rank contribution.
         assert torch.equal(module.weight, original), chunk
         assert module.forward.__func__ is original_forward
         got = module(x).detach().clone()
@@ -214,8 +232,6 @@ def test_continuum_conditioning_then_forward_survives_runtime_mode_repeated_clon
         chunk_model = vdn.clone()
         chunk_model.patch_model(device_to=torch.device("cpu"))
 
-        # The exact structural regression: conditioning executes before the first
-        # synthetic transformer evaluation on every Continuum-style chunk.
         conditioning = dm.preprocess_text_embeds(x).detach().clone()
         transformed = dm(x).detach().clone()
         assert dm.token_refiner.fc1.forward.__func__ is original_forward
@@ -260,7 +276,6 @@ def test_external_forward_owner_is_never_mutated_by_runtime_lifecycle():
     base = _base_patcher(runtime_capable=True)
     module = base.model.diffusion_model.linear
     true_forward = module.forward
-
     calls = {"n": 0}
 
     def external_forward(x):
@@ -268,7 +283,6 @@ def test_external_forward_owner_is_never_mutated_by_runtime_lifecycle():
         return true_forward(x)
 
     module.forward = external_forward
-
     vdn = _patched_from(base, mode="bypass")
     x = torch.randn(2, 8)
     for _ in range(5):
@@ -298,7 +312,7 @@ def test_runtime_mode_aggregates_multiple_adapters_into_one_weight_wrapper():
 
     wrappers = patcher.weight_wrapper_patches["diffusion_model.linear.weight"]
     assert len(wrappers) == 1
-    assert len(wrappers[0].terms) == 2
+    assert wrappers[0].source.term_count() == 2
 
     weight = base.model.diffusion_model.linear.weight.detach()
     expected_weight = weight + 0.75 * (b1 @ a1) + (1.2 * 0.5) * (b2 @ a2)

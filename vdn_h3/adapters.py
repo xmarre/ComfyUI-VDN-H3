@@ -8,7 +8,9 @@ load time; nothing on disk is converted.
 
 Fusion of three per-projection LoRA pairs (to_q/to_k/to_v) into one fused-qkv pair is
 exact: delta_W = concat(B_i @ A_i) = B_fused @ A_fused with A_fused = vstack(A_i) and
-B_fused block-diagonal.
+B_fused block-diagonal. The released adapters use one rank/alpha scale across each
+Q/K/V triplet; malformed or incompatible triplets fail closed rather than producing a
+shape that is rejected later by ModelPatcher.
 """
 import torch
 
@@ -48,7 +50,12 @@ def parse_adapter_state(sd):
             continue
         module, rest = key.split(".lora_", 1)
         side = rest.split(".")[0]                    # A or B
-        out.setdefault(module, {})[side] = tensor.float()
+        if side not in ("A", "B"):
+            continue
+        slot = out.setdefault(module, {})
+        if side in slot:
+            raise ValueError(f"duplicate LoRA {side} tensor for {module}")
+        slot[side] = tensor.float()
     return out
 
 
@@ -63,7 +70,22 @@ def per_module_scale(adapter_cfg, module):
     for pattern, value in (cfg.get("alpha_pattern") or {}).items():
         if pattern in module:
             alpha = value
+    if not isinstance(rank, (int, float)) or rank <= 0:
+        raise ValueError(f"invalid LoRA rank {rank!r} for {module}")
+    if not isinstance(alpha, (int, float)):
+        raise ValueError(f"invalid LoRA alpha {alpha!r} for {module}")
     return alpha / rank
+
+
+def _require_pair(module, sides):
+    if set(sides) != {"A", "B"}:
+        raise ValueError(
+            f"LoRA module {module} must contain exactly A and B tensors; got {sorted(sides)}")
+    a, b = sides["A"], sides["B"]
+    if a.ndim != 2 or b.ndim != 2 or a.shape[0] != b.shape[1]:
+        raise ValueError(
+            f"LoRA module {module} has incompatible A{tuple(a.shape)} B{tuple(b.shape)}")
+    return a, b
 
 
 def convert_adapter(sd, adapter_cfg):
@@ -77,35 +99,66 @@ def convert_adapter(sd, adapter_cfg):
     for module, sides in parsed.items():
         is_refiner = module.startswith("token_refiner.")
         path, kind = _comfy_path(module, is_refiner)
-        a, b = sides["A"], sides["B"]
+        a, b = _require_pair(module, sides)
         scale = per_module_scale(adapter_cfg, module)
         if kind == "qkv":
             qkv_groups.setdefault(path, []).append((module, a, b, scale))
             continue
         if kind == "swiglu":
+            if b.shape[0] % 2:
+                raise ValueError(
+                    f"SwiGLU LoRA B rows must be even for {module}; got {b.shape[0]}")
             half = b.shape[0] // 2
             value_half, gate_half = b[:half], b[half:]
             b = torch.cat([gate_half, value_half], dim=0)
+        if path in out:
+            raise ValueError(f"multiple adapter modules map to ComfyUI target {path}")
         out[path] = (a, b, scale)
+
+    expected_suffixes = ("to_q", "to_k", "to_v")
     for path, group in qkv_groups.items():
-        order = ("to_q", "to_k", "to_v")
+        by_suffix = {}
+        for item in group:
+            module = item[0]
+            suffixes = [s for s in expected_suffixes if module.endswith("." + s)]
+            if len(suffixes) != 1:
+                raise ValueError(f"cannot identify Q/K/V projection for {module}")
+            suffix = suffixes[0]
+            if suffix in by_suffix:
+                raise ValueError(f"duplicate {suffix} LoRA projection for {path}")
+            by_suffix[suffix] = item
+        missing = [s for s in expected_suffixes if s not in by_suffix]
+        if missing:
+            raise ValueError(
+                f"incomplete Q/K/V LoRA triplet for {path}; missing {missing}")
+        ordered = [by_suffix[s] for s in expected_suffixes]
 
-        def qkv_index(item):
-            return next(i for i, p in enumerate(order) if item[0].endswith("." + p))
-
-        group.sort(key=qkv_index)
-        rank = group[0][1].shape[0]
-        in_dim = group[0][1].shape[1]
-        out_dim = group[0][2].shape[0]
-        a_fused = torch.cat([g[1] for g in group], dim=0)          # [3r, in]
-        b_fused = torch.zeros(out_dim * 3, rank * 3, dtype=a_fused.dtype)
-        scales = []
-        for i, (_mod, a, b, scale) in enumerate(group):
-            b_fused[i * out_dim:(i + 1) * out_dim, i * rank:(i + 1) * rank] = b
-            scales.append(scale)
+        ranks = [item[1].shape[0] for item in ordered]
+        input_dims = [item[1].shape[1] for item in ordered]
+        output_dims = [item[2].shape[0] for item in ordered]
+        scales = [item[3] for item in ordered]
+        if len(set(ranks)) != 1:
+            raise ValueError(
+                f"mixed LoRA ranks across Q/K/V projections of {path}: {ranks}; "
+                "released VDN checkpoints use one rank per fused triplet")
+        if len(set(input_dims)) != 1 or len(set(output_dims)) != 1:
+            raise ValueError(
+                f"incompatible Q/K/V projection shapes for {path}: "
+                f"input={input_dims}, output={output_dims}")
         if len(set(scales)) != 1:
-            raise ValueError(f"mixed alpha/rank across qkv projections of {path}: "
-                             f"{scales}; cannot fold into one fused pair")
+            raise ValueError(
+                f"mixed alpha/rank across Q/K/V projections of {path}: {scales}; "
+                "cannot preserve post-matmul LoRA scaling in one fused patch")
+
+        rank = ranks[0]
+        out_dim = output_dims[0]
+        a_fused = torch.cat([item[1] for item in ordered], dim=0)  # [3r, in]
+        b_fused = torch.zeros(out_dim * 3, rank * 3, dtype=a_fused.dtype)
+        for i, (_mod, _a, b, _scale) in enumerate(ordered):
+            b_fused[i * out_dim:(i + 1) * out_dim,
+                    i * rank:(i + 1) * rank] = b
+        if path in out:
+            raise ValueError(f"multiple adapter modules map to ComfyUI target {path}")
         out[path] = (a_fused, b_fused, scales[0])
     return out
 

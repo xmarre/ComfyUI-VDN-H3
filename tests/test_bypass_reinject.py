@@ -1,106 +1,137 @@
-"""Regression test for the RecursionError after model reload (observed on the
-second generation when two adapter sets stack bypass hooks on the same modules).
+"""Lifecycle regression for the adapter architecture that replaced VDN bypass hooks.
 
-Legacy behavior: injection sets are ejected in list order, which restores a
-stale hook as module.forward; the next load then captures that hook as its own
-"original" and the forward self-recurses. _install_injection's LIFO eject must
-keep load/unload cycles stable. Run from anywhere with the ComfyUI venv python.
+The original Continuum crash was a cyclic ``module.forward`` chain.  VDN no longer
+installs such chains, so the regression now checks the stronger invariants directly:
+weight contribution is stable across clone/load/unload cycles, the base is restored,
+option/strength changes do not accumulate, and an unrelated forward owner remains
+untouched throughout.
 """
-import sys
-import types
-from pathlib import Path
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-_COMFYUI_ROOT = Path(__file__).resolve().parents[3]  # the ComfyUI checkout
-_PACKAGE = Path(__file__).resolve().parents[1]       # this package, any folder name
-sys.path.insert(0, str(_COMFYUI_ROOT))
-sys.path.insert(0, str(_PACKAGE))
+import comfy.model_patcher
 
-import comfy.model_management
-import comfy.weight_adapter
-from comfy.weight_adapter.bypass import BypassForwardHook
-from vdn_h3.apply import _FrugalLoRA, _install_injection
-
-comfy.model_management.get_torch_device = lambda: torch.device("cpu")
+from vdn_h3.apply import apply_adapters
 
 
-def _adapter():
-    up = torch.randn(8, 4)
-    down = torch.randn(4, 8) * 0.1
-    return _FrugalLoRA(set(), (up, down, torch.tensor(4.0)))  # alpha/rank = 1
-
-
-class _Patcher:
+class Diffusion(nn.Module):
     def __init__(self):
-        self.injections = {}
-        self.model = types.SimpleNamespace()  # the shared inner model (clone-shared)
-
-    def set_injections(self, key, value):
-        self.injections[key] = value
+        super().__init__()
+        self.linear = nn.Linear(8, 8, bias=False)
+        self.use_adaln_curves = False
 
 
-def _fresh_module():
-    torch.manual_seed(0)
-    mod = nn.Linear(8, 8)
-    return mod, mod.forward
+class ToyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.diffusion_model = Diffusion()
+        self.device = torch.device("cpu")
 
 
-def _legacy_cycle_breaks():
-    """Documents the bug: forward-order eject leaves a stale hook in place, so
-    re-injecting makes the hook its own original forward."""
-    mod, true_fwd = _fresh_module()
-    hook_d = BypassForwardHook(mod, _adapter(), multiplier=1.0)
-    hook_t = BypassForwardHook(mod, _adapter(), multiplier=1.0)
-    hook_d.inject()
-    hook_t.inject()                     # hook_t.original = hook_d._bypass_forward
-    hook_d.eject()                      # mod.forward = true forward
-    hook_t.eject()                      # mod.forward = hook_d._bypass_forward (!)
-    hook_d.inject()                     # hook_d.original = its own bypass forward
-    broken = hook_d.original_forward == hook_d._bypass_forward
-    mod.forward = true_fwd              # restore for cleanliness
-    return broken
+def _base_patcher():
+    torch.manual_seed(10)
+    return comfy.model_patcher.ModelPatcher(
+        ToyModel(), torch.device("cpu"), torch.device("cpu"))
 
 
-def test_lifo_cycles():
-    mod, true_fwd = _fresh_module()
-    hook_d = BypassForwardHook(mod, _adapter(), multiplier=1.0)
-    hook_t = BypassForwardHook(mod, _adapter(), multiplier=1.0)
-    patcher = _Patcher()
-    _install_injection(patcher, [hook_d, hook_t])
-    injection = patcher.injections["vdn_lora"][0]
+def _converted(seed=20):
+    gen = torch.Generator().manual_seed(seed)
+    a = torch.randn(3, 8, generator=gen)
+    b = torch.randn(8, 3, generator=gen)
+    return {"default": {"linear": (a, b, 1.0)}}
 
+
+def _patched_from(base, strength=1.0, seed=20):
+    patcher = base.clone()
+    report = apply_adapters(
+        patcher, _converted(seed), strength, mode="merge", stage_path=None)
+    assert report["default"]["native_weight_patches"] == 1
+    return patcher
+
+
+def test_native_patch_does_not_replace_forward():
+    base = _base_patcher()
+    module = base.model.diffusion_model.linear
+    true_func = module.forward.__func__
+    _patched_from(base)
+    assert module.forward.__func__ is true_func
+
+
+def test_repeated_clone_load_unload_is_stable_and_restores_base():
+    base = _base_patcher()
+    module = base.model.diffusion_model.linear
+    original = module.weight.detach().clone()
+    x = torch.randn(4, 8)
+    reference = None
+
+    vdn = _patched_from(base, strength=1.0)
+    for chunk in range(8):
+        # Continuum-style sequential MODEL clone reuse over the same resident inner model.
+        clone = vdn.clone()
+        clone.patch_model(device_to=torch.device("cpu"))
+        got = module(x).detach().clone()
+        if reference is None:
+            reference = got
+        else:
+            assert torch.allclose(got, reference, atol=1e-6, rtol=1e-6), chunk
+        clone.unpatch_model(device_to=torch.device("cpu"))
+        assert torch.equal(module.weight, original), chunk
+
+
+def test_strength_change_reapplies_from_true_base_not_previous_delta():
+    base = _base_patcher()
+    module = base.model.diffusion_model.linear
     x = torch.randn(3, 8)
-    base = true_fwd(x)
-    want = base + _adapter_lora(hook_d, x) + _adapter_lora(hook_t, x)
 
-    for cycle in range(3):
-        injection.inject(patcher)
-        assert mod.forward == hook_t._bypass_forward, f"cycle {cycle}: wrong outermost hook"
-        assert hook_t.original_forward == hook_d._bypass_forward, f"cycle {cycle}: T should wrap D"
-        assert hook_d.original_forward == true_fwd, f"cycle {cycle}: D should wrap the true forward"
-        got = mod(x)
-        assert torch.allclose(got, want, atol=1e-5), f"cycle {cycle}: wrong value"
-        injection.eject(patcher)
-        assert mod.forward == true_fwd, f"cycle {cycle}: true forward not restored"
-        assert hook_d.original_forward is None and hook_t.original_forward is None
-    print("lifo cycles: PASS (3x inject/eject, values correct, true forward restored)")
+    one = _patched_from(base, strength=1.0)
+    one.patch_model(device_to=torch.device("cpu"))
+    y1 = module(x).detach().clone()
+    one.unpatch_model(device_to=torch.device("cpu"))
 
+    half = _patched_from(base, strength=0.5)
+    half.patch_model(device_to=torch.device("cpu"))
+    yhalf = module(x).detach().clone()
+    half.unpatch_model(device_to=torch.device("cpu"))
 
-def _adapter_lora(hook, x):
-    up, down, _ = hook.adapter.weights
-    return torch.nn.functional.linear(
-        torch.nn.functional.linear(x, down), up)
+    y0 = module(x).detach().clone()
+    assert torch.allclose(yhalf - y0, 0.5 * (y1 - y0), atol=1e-5, rtol=1e-5)
 
 
-if __name__ == "__main__":
-    assert _legacy_cycle_breaks(), "legacy cycle did not reproduce the bug"
-    print("legacy cycle: reproduces the self-hook bug as expected")
-    test_lifo_cycles()
-    print("ALL PASS")
+def test_external_forward_owner_is_never_mutated_by_vdn_lifecycle():
+    base = _base_patcher()
+    module = base.model.diffusion_model.linear
+    true_forward = module.forward
+
+    # Structural stand-in for another provider owning module.forward.  VDN must not
+    # traverse, splice, replace or restore this chain at all.
+    calls = {"n": 0}
+    def external_forward(x):
+        calls["n"] += 1
+        return true_forward(x)
+    module.forward = external_forward
+
+    vdn = _patched_from(base)
+    x = torch.randn(2, 8)
+    for _ in range(5):
+        clone = vdn.clone()
+        assert module.forward is external_forward
+        clone.patch_model(device_to=torch.device("cpu"))
+        module(x)
+        assert module.forward is external_forward
+        clone.unpatch_model(device_to=torch.device("cpu"))
+        assert module.forward is external_forward
+    assert calls["n"] == 5
 
 
-
-
-
+def test_removed_bypass_fails_explicitly():
+    base = _base_patcher()
+    clone = base.clone()
+    try:
+        apply_adapters(clone, _converted(), 1.0, mode="bypass")
+    except RuntimeError as exc:
+        assert "removed" in str(exc).lower()
+        assert "module.forward" in str(exc)
+    else:
+        raise AssertionError("legacy bypass mode unexpectedly remained active")

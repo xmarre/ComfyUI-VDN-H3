@@ -83,6 +83,22 @@ def test_root_prefix_is_valid_dense_checkpoint_candidate(tmp_path, monkeypatch):
     assert torch.all(embedder.proj_in_weight == 0.125)
 
 
+def test_local_companion_is_authoritative(tmp_path, monkeypatch):
+    stage_dir = tmp_path / "stage"
+    stage_dir.mkdir()
+    local = stage_dir / curve.TIME_EMBEDDER_FILENAME
+    installed = tmp_path / "installed.safetensors"
+    save_file(_dense_tensors(0.25), local)
+    save_file(_dense_tensors(0.75), installed)
+    monkeypatch.setattr(curve, "_candidate_dense_checkpoints", lambda: [str(installed)])
+    monkeypatch.setattr(curve, "_curve_fit_residual", lambda table, dense: 0.0)
+    curve._EMBEDDER_CACHE.clear()
+
+    embedder, _ = curve.find_dense_time_embedder(str(stage_dir), torch.zeros(3, 2))
+    assert os.path.realpath(embedder.source) == os.path.realpath(local)
+    assert torch.all(embedder.proj_in_weight == 0.25)
+
+
 def test_replacing_candidate_file_invalidates_embedder_cache(tmp_path, monkeypatch):
     candidate = tmp_path / "dense.safetensors"
     save_file(_dense_tensors(0.125), candidate)
@@ -115,3 +131,14 @@ def test_invalid_curve_table_shape_fails_closed(tmp_path):
         assert "invalid shape" in str(exc)
     else:
         raise AssertionError("invalid one-row AdaLN table was accepted")
+
+
+def test_truncated_safetensors_header_fails_closed(tmp_path):
+    broken = tmp_path / "broken.safetensors"
+    broken.write_bytes((128).to_bytes(8, "little") + b"{}")
+    try:
+        curve._safetensors_header(str(broken))
+    except ValueError as exc:
+        assert "truncated safetensors JSON header" in str(exc)
+    else:
+        raise AssertionError("truncated safetensors header was accepted")

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import collections
 import contextvars
+import copy
 import logging
 
 import torch
@@ -157,13 +158,21 @@ def make_vdn_forward(attn, state, block_index):
     inner = heads * head_dim
     qkv_proj, out_proj = attn.qkv_proj, attn.out_proj
     q_norm, k_norm = attn.q_norm, attn.k_norm
-    branch = state.branches[block_index]
+    base_branch = state.branches[block_index]
     cfg = state.cfg
 
     def vdn_forward(x, rope_freqs=None, transformer_options={}):
         layout = state.layout
-        if layout is None or branch is None:
+        if layout is None or base_branch is None:
             return _base_attention(attn, x, rope_freqs, transformer_options)
+
+        # LinearBranch owns only immutable checkpoint references/config plus two small
+        # lazy delta-backend cache fields. ModelPatcher clones share VDNState, so use a
+        # shallow execution copy to prevent different simultaneous frame/text lengths
+        # from racing those cache fields. Tensor storage is still shared.
+        branch = copy.copy(base_branch)
+        branch._backend = None
+        branch._backend_key = None
 
         s = x.shape[0]
         device, dtype = x.device, x.dtype

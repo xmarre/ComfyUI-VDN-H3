@@ -1,106 +1,341 @@
-"""Regression test for the RecursionError after model reload (observed on the
-second generation when two adapter sets stack bypass hooks on the same modules).
+"""Lifecycle regressions for VDN merge and safe runtime-low-VRAM adapters.
 
-Legacy behavior: injection sets are ejected in list order, which restores a
-stale hook as module.forward; the next load then captures that hook as its own
-"original" and the forward self-recurses. _install_injection's LIFO eject must
-keep load/unload cycles stable. Run from anywhere with the ComfyUI venv python.
+The original Continuum crash was a cyclic ``module.forward`` chain. The restored
+``lora_mode=bypass`` no longer means BypassForwardHook: it is a Comfy-owned
+``weight_function`` wrapper backed by an additional ModelPatcher containing only the
+low-rank A/B tensors.
 """
-import sys
-import types
-from pathlib import Path
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-_COMFYUI_ROOT = Path(__file__).resolve().parents[3]  # the ComfyUI checkout
-_PACKAGE = Path(__file__).resolve().parents[1]       # this package, any folder name
-sys.path.insert(0, str(_COMFYUI_ROOT))
-sys.path.insert(0, str(_PACKAGE))
+import comfy.model_patcher
+import comfy.ops
 
-import comfy.model_management
-import comfy.weight_adapter
-from comfy.weight_adapter.bypass import BypassForwardHook
-from vdn_h3.apply import _FrugalLoRA, _install_injection
-
-comfy.model_management.get_torch_device = lambda: torch.device("cpu")
+from vdn_h3.apply import _RuntimeLoRAWeight, apply_adapters
+from vdn_h3.managed import RuntimeLoRATermsModel
 
 
-def _adapter():
-    up = torch.randn(8, 4)
-    down = torch.randn(4, 8) * 0.1
-    return _FrugalLoRA(set(), (up, down, torch.tensor(4.0)))  # alpha/rank = 1
+def _comfy_linear(dim=8):
+    layer = comfy.ops.disable_weight_init.Linear(
+        dim, dim, bias=False, device="cpu", dtype=torch.float32)
+    with torch.no_grad():
+        layer.weight.copy_(torch.randn(dim, dim))
+    return layer
 
 
-class _Patcher:
-    def __init__(self):
-        self.injections = {}
-        self.model = types.SimpleNamespace()  # the shared inner model (clone-shared)
-
-    def set_injections(self, key, value):
-        self.injections[key] = value
+class Diffusion(nn.Module):
+    def __init__(self, runtime_capable=False):
+        super().__init__()
+        self.linear = _comfy_linear() if runtime_capable else nn.Linear(8, 8, bias=False)
+        self.use_adaln_curves = False
 
 
-def _fresh_module():
-    torch.manual_seed(0)
-    mod = nn.Linear(8, 8)
-    return mod, mod.forward
+class ToyModel(nn.Module):
+    def __init__(self, runtime_capable=False):
+        super().__init__()
+        self.diffusion_model = Diffusion(runtime_capable=runtime_capable)
+        self.device = torch.device("cpu")
 
 
-def _legacy_cycle_breaks():
-    """Documents the bug: forward-order eject leaves a stale hook in place, so
-    re-injecting makes the hook its own original forward."""
-    mod, true_fwd = _fresh_module()
-    hook_d = BypassForwardHook(mod, _adapter(), multiplier=1.0)
-    hook_t = BypassForwardHook(mod, _adapter(), multiplier=1.0)
-    hook_d.inject()
-    hook_t.inject()                     # hook_t.original = hook_d._bypass_forward
-    hook_d.eject()                      # mod.forward = true forward
-    hook_t.eject()                      # mod.forward = hook_d._bypass_forward (!)
-    hook_d.inject()                     # hook_d.original = its own bypass forward
-    broken = hook_d.original_forward == hook_d._bypass_forward
-    mod.forward = true_fwd              # restore for cleanliness
-    return broken
+class ConditioningDiffusion(nn.Module):
+    def __init__(self, runtime_capable=False):
+        super().__init__()
+        self.token_refiner = nn.Module()
+        self.token_refiner.fc1 = (
+            _comfy_linear() if runtime_capable else nn.Linear(8, 8, bias=False))
+        self.transformer_eval = (
+            _comfy_linear() if runtime_capable else nn.Linear(8, 8, bias=False))
+        self.use_adaln_curves = False
+
+    def preprocess_text_embeds(self, x):
+        return torch.nn.functional.silu(self.token_refiner.fc1(x))
+
+    def forward(self, x):
+        return self.transformer_eval(x)
 
 
-def test_lifo_cycles():
-    mod, true_fwd = _fresh_module()
-    hook_d = BypassForwardHook(mod, _adapter(), multiplier=1.0)
-    hook_t = BypassForwardHook(mod, _adapter(), multiplier=1.0)
-    patcher = _Patcher()
-    _install_injection(patcher, [hook_d, hook_t])
-    injection = patcher.injections["vdn_lora"][0]
+class ConditioningToyModel(nn.Module):
+    def __init__(self, runtime_capable=False):
+        super().__init__()
+        self.diffusion_model = ConditioningDiffusion(runtime_capable=runtime_capable)
+        self.device = torch.device("cpu")
 
+
+def _base_patcher(runtime_capable=False):
+    torch.manual_seed(10)
+    return comfy.model_patcher.ModelPatcher(
+        ToyModel(runtime_capable=runtime_capable),
+        torch.device("cpu"), torch.device("cpu"))
+
+
+def _conditioning_base_patcher(runtime_capable=False):
+    torch.manual_seed(11)
+    return comfy.model_patcher.ModelPatcher(
+        ConditioningToyModel(runtime_capable=runtime_capable),
+        torch.device("cpu"), torch.device("cpu"))
+
+
+def _converted(seed=20):
+    gen = torch.Generator().manual_seed(seed)
+    a = torch.randn(3, 8, generator=gen)
+    b = torch.randn(8, 3, generator=gen)
+    return {"default": {"linear": (a, b, 1.0)}}
+
+
+def _conditioning_converted(seed=21):
+    gen = torch.Generator().manual_seed(seed)
+    a = torch.randn(3, 8, generator=gen)
+    b = torch.randn(8, 3, generator=gen)
+    return {"default": {"token_refiner.fc1": (a, b, 1.0)}}
+
+
+def _patched_from(base, strength=1.0, seed=20, mode="merge"):
+    patcher = base.clone()
+    report = apply_adapters(
+        patcher, _converted(seed), strength, mode=mode, stage_path=None)
+    if mode == "merge":
+        assert report["default"]["native_weight_patches"] == 1
+    else:
+        assert report["default"]["runtime_weight_targets"] == 1
+        runtime = report["runtime_lowvram"]
+        assert runtime["weight_wrappers"] == 1
+        assert runtime["forward_hooks"] == 0
+        assert runtime["managed_adapter_bytes"] > 0
+        assert runtime["delta_buffer_limit_bytes"] > 0
+        assert runtime["owner_key"].startswith("vdn_runtime_lora_")
+    return patcher
+
+
+def _direct_runtime_wrapper(terms):
+    source = RuntimeLoRATermsModel(
+        {"linear": terms}, torch.device("cpu"))
+    return _RuntimeLoRAWeight(
+        "diffusion_model.linear.weight", "linear", source)
+
+
+def test_runtime_wrapper_matches_explicit_delta_without_mutating_input():
+    torch.manual_seed(1)
+    weight = torch.randn(8, 8)
+    original = weight.clone()
+    a1 = torch.randn(3, 8)
+    b1 = torch.randn(8, 3)
+    a2 = torch.randn(2, 8)
+    b2 = torch.randn(8, 2)
+    wrapper = _direct_runtime_wrapper(
+        [(a1, b1, 0.75), (a2, b2, -0.2)])
+
+    got = wrapper(weight)
+    expected = weight + 0.75 * (b1 @ a1) - 0.2 * (b2 @ a2)
+    assert torch.allclose(got, expected, atol=2e-6, rtol=2e-6)
+    assert torch.equal(weight, original)
+    assert not hasattr(wrapper, "prepared_patches")
+    assert not hasattr(wrapper, "original_forward")
+
+
+def test_runtime_mode_registers_weight_wrapper_not_injection_or_forward_patch():
+    base = _base_patcher(runtime_capable=True)
+    module = base.model.diffusion_model.linear
+    original_forward = module.forward.__func__
+    vdn = _patched_from(base, mode="bypass")
+
+    assert not vdn.injections
+    assert not any(key.endswith("linear.forward") for key in vdn.object_patches)
+    wrappers = vdn.weight_wrapper_patches["diffusion_model.linear.weight"]
+    assert len(wrappers) == 1
+    assert wrappers[0]._vdn_runtime_lora is True
+    assert wrappers[0].source.term_count() == 1
+    runtime_keys = [k for k in vdn.additional_models if k.startswith("vdn_runtime_lora_")]
+    assert len(runtime_keys) == 1
+    assert module.forward.__func__ is original_forward
+
+
+def test_runtime_mode_fails_closed_without_weight_function_contract():
+    base = _base_patcher(runtime_capable=False)
+    clone = base.clone()
+    try:
+        apply_adapters(clone, _converted(), 1.0, mode="bypass", stage_path=None)
+    except RuntimeError as exc:
+        assert "weight_function" in str(exc)
+        assert "merge" in str(exc)
+    else:
+        raise AssertionError("runtime mode accepted an unsupported plain nn.Linear")
+
+
+def test_native_patch_does_not_replace_forward():
+    base = _base_patcher()
+    module = base.model.diffusion_model.linear
+    true_func = module.forward.__func__
+    _patched_from(base)
+    assert module.forward.__func__ is true_func
+
+
+def test_repeated_merge_clone_load_unload_is_stable_and_restores_base():
+    base = _base_patcher()
+    module = base.model.diffusion_model.linear
+    original = module.weight.detach().clone()
+    x = torch.randn(4, 8)
+    reference = None
+
+    vdn = _patched_from(base, strength=1.0)
+    for chunk in range(8):
+        clone = vdn.clone()
+        clone.patch_model(device_to=torch.device("cpu"))
+        got = module(x).detach().clone()
+        if reference is None:
+            reference = got
+        else:
+            assert torch.allclose(got, reference, atol=1e-6, rtol=1e-6), chunk
+        clone.unpatch_model(device_to=torch.device("cpu"))
+        assert torch.equal(module.weight, original), chunk
+
+
+def test_repeated_runtime_clone_load_unload_is_stable_and_never_merges_base():
+    base = _base_patcher(runtime_capable=True)
+    module = base.model.diffusion_model.linear
+    original = module.weight.detach().clone()
+    original_forward = module.forward.__func__
+    x = torch.randn(4, 8)
+    reference = None
+
+    vdn = _patched_from(base, strength=1.0, mode="bypass")
+    for chunk in range(12):
+        clone = vdn.clone()
+        clone.patch_model(device_to=torch.device("cpu"))
+        assert torch.equal(module.weight, original), chunk
+        assert module.forward.__func__ is original_forward
+        got = module(x).detach().clone()
+        if reference is None:
+            reference = got
+        else:
+            assert torch.allclose(got, reference, atol=1e-6, rtol=1e-6), chunk
+        clone.unpatch_model(device_to=torch.device("cpu"))
+        assert torch.equal(module.weight, original), chunk
+        assert module.forward.__func__ is original_forward
+
+
+def test_continuum_conditioning_then_forward_survives_runtime_mode_repeated_clones():
+    base = _conditioning_base_patcher(runtime_capable=True)
+    dm = base.model.diffusion_model
+    original_fc1 = dm.token_refiner.fc1.weight.detach().clone()
+    original_forward = dm.token_refiner.fc1.forward.__func__
+    x = torch.randn(5, 8)
+
+    vdn = base.clone()
+    report = apply_adapters(
+        vdn, _conditioning_converted(), 1.0, mode="bypass", stage_path=None)
+    assert report["default"]["runtime_weight_targets"] == 1
+    assert not vdn.injections
+
+    conditioning_reference = None
+    forward_reference = None
+    for chunk in range(12):
+        chunk_model = vdn.clone()
+        chunk_model.patch_model(device_to=torch.device("cpu"))
+
+        conditioning = dm.preprocess_text_embeds(x).detach().clone()
+        transformed = dm(x).detach().clone()
+        assert dm.token_refiner.fc1.forward.__func__ is original_forward
+        assert torch.equal(dm.token_refiner.fc1.weight, original_fc1)
+
+        if conditioning_reference is None:
+            conditioning_reference = conditioning
+            forward_reference = transformed
+        else:
+            assert torch.allclose(
+                conditioning, conditioning_reference, atol=1e-6, rtol=1e-6), chunk
+            assert torch.allclose(
+                transformed, forward_reference, atol=1e-6, rtol=1e-6), chunk
+
+        chunk_model.unpatch_model(device_to=torch.device("cpu"))
+        assert torch.equal(dm.token_refiner.fc1.weight, original_fc1), chunk
+        assert dm.token_refiner.fc1.forward.__func__ is original_forward
+
+
+def test_runtime_strength_change_reapplies_from_true_base_not_previous_delta():
+    base = _base_patcher(runtime_capable=True)
+    module = base.model.diffusion_model.linear
+    original = module.weight.detach().clone()
     x = torch.randn(3, 8)
-    base = true_fwd(x)
-    want = base + _adapter_lora(hook_d, x) + _adapter_lora(hook_t, x)
+    y0 = F.linear(x, original)
 
-    for cycle in range(3):
-        injection.inject(patcher)
-        assert mod.forward == hook_t._bypass_forward, f"cycle {cycle}: wrong outermost hook"
-        assert hook_t.original_forward == hook_d._bypass_forward, f"cycle {cycle}: T should wrap D"
-        assert hook_d.original_forward == true_fwd, f"cycle {cycle}: D should wrap the true forward"
-        got = mod(x)
-        assert torch.allclose(got, want, atol=1e-5), f"cycle {cycle}: wrong value"
-        injection.eject(patcher)
-        assert mod.forward == true_fwd, f"cycle {cycle}: true forward not restored"
-        assert hook_d.original_forward is None and hook_t.original_forward is None
-    print("lifo cycles: PASS (3x inject/eject, values correct, true forward restored)")
+    one = _patched_from(base, strength=1.0, mode="bypass")
+    half = _patched_from(base, strength=0.5, mode="bypass")
 
+    # Comfy currently does not compare weight_wrapper_patches inside
+    # clone_has_same_weights(). Distinct runtime-owner keys therefore deliberately
+    # make differently configured Apply results non-equivalent, forcing model
+    # management to reload rather than reusing a stale wrapper set.
+    assert set(one.additional_models) != set(half.additional_models)
+    assert not one.clone_has_same_weights(half)
 
-def _adapter_lora(hook, x):
-    up, down, _ = hook.adapter.weights
-    return torch.nn.functional.linear(
-        torch.nn.functional.linear(x, down), up)
+    one.patch_model(device_to=torch.device("cpu"))
+    y1 = module(x).detach().clone()
+    one.unpatch_model(device_to=torch.device("cpu"))
+    assert torch.equal(module.weight, original)
 
+    half.patch_model(device_to=torch.device("cpu"))
+    yhalf = module(x).detach().clone()
+    half.unpatch_model(device_to=torch.device("cpu"))
+    assert torch.equal(module.weight, original)
 
-if __name__ == "__main__":
-    assert _legacy_cycle_breaks(), "legacy cycle did not reproduce the bug"
-    print("legacy cycle: reproduces the self-hook bug as expected")
-    test_lifo_cycles()
-    print("ALL PASS")
+    assert torch.allclose(yhalf - y0, 0.5 * (y1 - y0), atol=1e-5, rtol=1e-5)
 
 
+def test_runtime_clone_retains_same_owner_and_is_weight_equivalent():
+    base = _base_patcher(runtime_capable=True)
+    vdn = _patched_from(base, strength=0.75, mode="bypass")
+    clone = vdn.clone()
+
+    assert set(vdn.additional_models) == set(clone.additional_models)
+    assert vdn.clone_has_same_weights(clone)
 
 
+def test_external_forward_owner_is_never_mutated_by_runtime_lifecycle():
+    base = _base_patcher(runtime_capable=True)
+    module = base.model.diffusion_model.linear
+    true_forward = module.forward
+    calls = {"n": 0}
 
+    def external_forward(x):
+        calls["n"] += 1
+        return true_forward(x)
+
+    module.forward = external_forward
+    vdn = _patched_from(base, mode="bypass")
+    x = torch.randn(2, 8)
+    for _ in range(5):
+        clone = vdn.clone()
+        assert module.forward is external_forward
+        clone.patch_model(device_to=torch.device("cpu"))
+        module(x)
+        assert module.forward is external_forward
+        clone.unpatch_model(device_to=torch.device("cpu"))
+        assert module.forward is external_forward
+    assert calls["n"] == 5
+
+
+def test_runtime_mode_aggregates_multiple_adapters_into_one_weight_wrapper():
+    base = _base_patcher(runtime_capable=True)
+    gen = torch.Generator().manual_seed(30)
+    a1, b1 = torch.randn(2, 8, generator=gen), torch.randn(8, 2, generator=gen)
+    a2, b2 = torch.randn(3, 8, generator=gen), torch.randn(8, 3, generator=gen)
+    converted = {
+        "default": {"linear": (a1, b1, 1.0)},
+        "turbo": {"linear": (a2, b2, 0.5)},
+    }
+    patcher = base.clone()
+    apply_adapters(
+        patcher, converted, {"default": 0.75, "turbo": 1.2},
+        mode="bypass", stage_path=None)
+
+    wrappers = patcher.weight_wrapper_patches["diffusion_model.linear.weight"]
+    assert len(wrappers) == 1
+    assert wrappers[0].source.term_count() == 2
+
+    weight = base.model.diffusion_model.linear.weight.detach()
+    expected_weight = weight + 0.75 * (b1 @ a1) + (1.2 * 0.5) * (b2 @ a2)
+    got_weight = wrappers[0](weight)
+    assert torch.allclose(got_weight, expected_weight, atol=2e-6, rtol=2e-6)

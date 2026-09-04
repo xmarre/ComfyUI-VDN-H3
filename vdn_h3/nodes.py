@@ -69,6 +69,34 @@ def _free_vram():
     return comfy.model_management.get_free_memory(device)
 
 
+def _effective_free_vram(model):
+    """Conservative free VRAM after reserving still-unloaded base-model bytes.
+
+    Apply nodes may execute before Comfy has made the supplied H3 MODEL resident. Raw
+    allocator free memory would then make `auto` optimistically choose a resident VDN
+    branch or retained scratch even though the base itself still has to load. Reserve
+    the ModelPatcher's remaining model bytes before applying the placement heuristics.
+    """
+    raw = int(_free_vram())
+    try:
+        model_size = int(model.model_size())
+        loaded_size = int(model.loaded_size())
+        remaining = max(0, model_size - loaded_size)
+    except Exception as exc:
+        # Current and pinned Comfy expose both methods. If an older/custom patcher
+        # does not, do not invent a model-size estimate; explicit stream/off remains
+        # available and the current compatibility smoke will catch core API drift.
+        _log.warning(
+            "[vdn] could not reserve unloaded MODEL bytes for auto VRAM policy (%s); "
+            "using raw free-memory reading", exc)
+        remaining = 0
+    effective = max(0, raw - remaining)
+    _log.info(
+        "[vdn] auto VRAM budget: %.2f GiB raw - %.2f GiB unloaded base = %.2f GiB",
+        raw / (1 << 30), remaining / (1 << 30), effective / (1 << 30))
+    return effective
+
+
 def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
                attention_backend, verbose, apply_turbo_adapter=True,
                cfg_overrides=None, fast_kernels=False, retain_buffers="auto"):
@@ -87,7 +115,11 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
             f"retain_buffers must be auto, on or off, got {retain_buffers!r}")
 
     path = spec.resolve_vdn_checkpoint(vdn_checkpoint)
-    free = _free_vram() if branch_weights == "auto" or retain_buffers == "auto" else None
+    free = (
+        _effective_free_vram(model)
+        if branch_weights == "auto" or retain_buffers == "auto"
+        else None
+    )
     prefer_int8 = False
     if branch_weights == "auto":
         branch_weights, prefer_int8 = policy.auto_branch_policy(path, free)
@@ -242,17 +274,17 @@ class ApplyVDNH3:
                            "the LoRA per layer without VDN touching module.forward."}),
             "branch_weights": (["auto", "stream", "resident"], {
                 "default": "auto",
-                "tooltip": "auto: resident BF16 when free VRAM exceeds 1.5x branch "
-                           "size + 4 GiB; otherwise stream and prefer the native INT8 "
-                           "ConvRot branch when available. stream resolves one block "
-                           "at a time with safe one-block prefetch when buffers are "
-                           "retained. resident is a Comfy-managed additional model."}),
+                "tooltip": "auto: resident BF16 when the base-reserved VRAM budget "
+                           "exceeds 1.5x branch size + 4 GiB; otherwise stream and "
+                           "prefer native INT8 ConvRot when available. stream resolves "
+                           "one block at a time with safe one-block prefetch when buffers "
+                           "are retained. resident is a Comfy-managed additional model."}),
             "retain_buffers": (["auto", "on", "off"], {
                 "default": "auto",
-                "tooltip": "auto retains VDN-owned scratch when free VRAM is at least "
-                           "the selected branch size + 10 GiB. Retained scratch is "
-                           "leased per model execution; concurrent/nested runs fall "
-                           "back to isolated transient storage."}),
+                "tooltip": "auto retains VDN-owned scratch when the base-reserved VRAM "
+                           "budget is at least selected branch size + 10 GiB. Scratch is "
+                           "leased per execution; concurrent/nested runs use isolated "
+                           "transient storage."}),
             "verbose": ("BOOLEAN", {"default": False}),
             "attention_backend": (["grouped", "flex"], {
                 "default": "grouped",

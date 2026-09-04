@@ -119,12 +119,12 @@ def make_layout_wrapper(state):
         try:
             return executor(*args, **kwargs)
         finally:
-            # ContextVar reset is safe under nested execution and concurrent clones.
             state._layout.reset(token)
     return wrap
 
 
 def _base_attention(attn, x, rope_freqs, transformer_options):
+    transformer_options = transformer_options or {}
     s = x.shape[0]
     q, k, v = attn.qkv_proj(x).split(attn.heads * attn.head_dim, dim=-1)
     v = v.view(s, attn.heads, attn.head_dim)
@@ -161,7 +161,8 @@ def make_vdn_forward(attn, state, block_index):
     base_branch = state.branches[block_index]
     cfg = state.cfg
 
-    def vdn_forward(x, rope_freqs=None, transformer_options={}):
+    def vdn_forward(x, rope_freqs=None, transformer_options=None):
+        transformer_options = transformer_options or {}
         layout = state.layout
         if layout is None or base_branch is None:
             return _base_attention(attn, x, rope_freqs, transformer_options)
@@ -211,9 +212,6 @@ def make_vdn_forward(attn, state, block_index):
         v = v.clone()
 
         if window_active:
-            # Fallback is intentionally execution-local. VDNState is shared by
-            # ModelPatcher clones, so mutating a configured backend after one transient
-            # failure would leak runtime state into later Continuum chunks/clones.
             backend = state.softmax_backend
             if backend == "flex":
                 from vdn_h3.window import window_softmax_flex

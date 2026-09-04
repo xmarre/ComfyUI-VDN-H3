@@ -45,9 +45,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
           python -m pip install -r _deps/ComfyUI/requirements.txt
-          python -m pip install pytest pytest-timeout safetensors
-      - name: Compile Python sources
-        run: python -m compileall -q vdn_h3 tests tools
+          python -m pip install pytest pytest-timeout ruff safetensors
+      - name: Ruff and compile Python sources
+        run: |
+          python -m ruff check vdn_h3 tests tools
+          python -m compileall -q vdn_h3 tests tools
       - name: Run VDN test suite
         env:
           COMFYUI_ROOT: ${{ github.workspace }}/_deps/ComfyUI

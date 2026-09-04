@@ -1,9 +1,9 @@
 """Apply released VDN adapters through ComfyUI-owned patch mechanisms.
 
-VDN intentionally does *not* participate in ``BypassForwardHook`` chains.  Ordinary
+VDN intentionally does *not* participate in ``BypassForwardHook`` chains. Ordinary
 LoRA targets, including quantized/fused weights, are registered with
 ``ModelPatcher.add_patches`` so Comfy owns backup/restore, low-VRAM application and
-clone semantics.  Full-width AdaLN LoRAs on a curve/pruned H3 base are reconstructed
+clone semantics. Full-width AdaLN LoRAs on a curve/pruned H3 base are reconstructed
 at runtime by :mod:`vdn_h3.curve` and installed as ordinary ModelPatcher object
 patches; they are not mutable injection hooks.
 """
@@ -19,6 +19,7 @@ import comfy.patcher_extension
 import comfy.utils
 
 from vdn_h3.curve import (
+    CurveAdalnState,
     find_dense_time_embedder,
     make_curve_adaln_forward,
     make_dense_curve_wrapper,
@@ -95,7 +96,7 @@ def _install_curve_adaln(new_model, dm, stage_path, terms_by_module):
     """Install exact full-width AdaLN deltas on a curve H3 base.
 
     ``terms_by_module`` contains the original dense LoRA factors; no low-rank curve
-    projection is performed.  ModelPatcher owns every changed object and restores it
+    projection is performed. ModelPatcher owns every changed object and restores it
     on unload before/after other providers according to core lifecycle semantics.
     """
     if not terms_by_module:
@@ -116,12 +117,12 @@ def _install_curve_adaln(new_model, dm, stage_path, terms_by_module):
     _log.info("[vdn] curve AdaLN source: %s (base-curve residual %.3e)",
               embedder.source, residual)
 
-    shared = {"dense_silu_temb": None}
+    state = CurveAdalnState()
     wrapper_key = "vdn_curve_adaln"
     new_model.add_wrapper_with_key(
         comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
         wrapper_key,
-        make_dense_curve_wrapper(dm, embedder, shared),
+        make_dense_curve_wrapper(dm, embedder, state),
     )
 
     for module, terms in terms_by_module.items():
@@ -136,7 +137,7 @@ def _install_curve_adaln(new_model, dm, stage_path, terms_by_module):
         base = new_model.get_model_object(f"diffusion_model.{parent}")
         new_model.add_object_patch(
             object_key,
-            make_curve_adaln_forward(base, terms, shared),
+            make_curve_adaln_forward(base, terms, state),
         )
     return embedder.source, residual
 
@@ -146,7 +147,7 @@ def apply_adapters(new_model, converted_by_name, strength, mode="merge",
     """Apply converted released adapters to a cloned MiniMax-H3 ModelPatcher.
 
     ``mode`` remains in the Python signature only so old serialized workflows fail
-    with an explicit migration message.  The node UI exposes only ``merge``.
+    with an explicit migration message. The node UI exposes only ``merge``.
     ``strength`` may be one float or ``{adapter_name: float}``.
     """
     if mode != "merge":

@@ -1,4 +1,4 @@
-"""Pytest path setup for standalone, CI and in-place ComfyUI custom-node runs."""
+"""Pytest path/setup for standalone, CI and in-place ComfyUI custom-node runs."""
 import os
 import sys
 from pathlib import Path
@@ -11,3 +11,14 @@ _OPENVDN_ROOT = os.environ.get("OPENVDN_ROOT")
 for path in (str(_COMFYUI_ROOT), str(_PACKAGE), _OPENVDN_ROOT):
     if path and path not in sys.path:
         sys.path.insert(0, path)
+
+# Comfy's model_management selects CUDA at import time unless its CLI state says
+# otherwise. CI intentionally uses CPU-only PyTorch; set only the already-parsed
+# Comfy option rather than rewriting pytest's argv.
+try:
+    import torch
+    if not torch.cuda.is_available():
+        import comfy.cli_args
+        comfy.cli_args.args.cpu = True
+except ImportError:
+    pass

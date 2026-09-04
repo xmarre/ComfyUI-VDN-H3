@@ -86,11 +86,11 @@ jobs:
           python - <<'PY'
           import importlib.util
           import pathlib
-          import sys
 
-          # Comfy's model_management selects CUDA during import unless its CLI CPU
-          # mode is active. This lane intentionally installs CPU-only PyTorch.
-          sys.argv = [sys.argv[0], '--cpu']
+          # Comfy disables argv parsing for library imports. Set its parsed CPU flag
+          # directly before importing model_management; this lane uses CPU-only torch.
+          import comfy.cli_args
+          comfy.cli_args.args.cpu = True
 
           root = pathlib.Path('.').resolve()
           spec = importlib.util.spec_from_file_location(

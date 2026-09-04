@@ -48,18 +48,17 @@ jobs:
           python -m pip install pytest pytest-timeout safetensors
       - name: Compile Python sources
         run: python -m compileall -q vdn_h3 tests tools
-      - name: Run test suite
+      - name: Run VDN test suite
         env:
           COMFYUI_ROOT: ${{ github.workspace }}/_deps/ComfyUI
           OPENVDN_ROOT: ${{ github.workspace }}/_deps/openvdn
           PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/_deps/ComfyUI:${{ github.workspace }}/_deps/openvdn
-        run: pytest -q --timeout=120
+        run: pytest -q tests --timeout=120
 
   comfy-main-smoke:
     name: Current Comfy main smoke
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Checkout current ComfyUI main
@@ -85,9 +84,18 @@ jobs:
         run: |
           python -m compileall -q vdn_h3
           python - <<'PY'
-          import importlib.util, pathlib
+          import importlib.util
+          import pathlib
+          import sys
+
+          # Comfy's model_management selects CUDA during import unless its CLI CPU
+          # mode is active. This lane intentionally installs CPU-only PyTorch.
+          sys.argv = [sys.argv[0], '--cpu']
+
           root = pathlib.Path('.').resolve()
-          spec = importlib.util.spec_from_file_location('comfy_vdn_h3', root / '__init__.py', submodule_search_locations=[str(root)])
+          spec = importlib.util.spec_from_file_location(
+              'comfy_vdn_h3', root / '__init__.py',
+              submodule_search_locations=[str(root)])
           mod = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(mod)
           assert {'ApplyVDNH3', 'ApplyVDNH3Advanced'} <= set(mod.NODE_CLASS_MAPPINGS)

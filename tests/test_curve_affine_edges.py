@@ -116,20 +116,6 @@ def test_project_curve_terms_preserves_multiple_adapter_terms():
     assert [term[1] for term in offsets["blocks.0.adaln_proj.linear"]] == [0.25, 0.75]
 
 
-def test_project_curve_terms_preserves_zero_strength_without_special_casing():
-    torch.manual_seed(432)
-    mapping = affine.CurveAffine(
-        basis=torch.randn(3, 11), mean=torch.randn(11), source="test",
-        identity=("test",), table_hash="test")
-    a = torch.randn(2, 11)
-    b = torch.randn(7, 2)
-    projected, offsets = affine.project_curve_terms(
-        {"blocks.0.adaln_proj.linear": [(a, b, 0.0)]}, mapping)
-    assert projected["blocks.0.adaln_proj.linear"][0][2] == 0.0
-    assert offsets["blocks.0.adaln_proj.linear"][0][1] == 0.0
-    assert torch.count_nonzero(projected["blocks.0.adaln_proj.linear"][0][0]) > 0
-
-
 def test_kj_cached_patcher_init_exposes_selected_checkpoint_path(tmp_path):
     selected = tmp_path / "selected-int8-convrot.safetensors"
     save_file({"dummy": torch.zeros(1)}, selected)

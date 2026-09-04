@@ -147,9 +147,9 @@ This is separate from `lora_mode`.
 
 ### `branch_weights=auto`
 
-The automatic policy incorporates upstream v1.4's VRAM-aware intent while retaining this branch's stronger ownership rules:
+The automatic policy incorporates upstream v1.4's VRAM-aware intent while retaining this branch's stronger ownership rules. The memory budget is **effective free VRAM**: Comfy's current free-memory value minus any bytes of the supplied base `MODEL` that are not resident yet. This prevents an unloaded H3 base from being counted as free space available to VDN.
 
-- if the ordinary branch fits the upstream `1.5 x branch size + 4 GiB` headroom rule, use `resident` BF16 branch weights;
+- if the ordinary branch fits the upstream `1.5 x branch size + 4 GiB` headroom rule in that effective budget, use `resident` BF16 branch weights;
 - otherwise, if `model_int8_convrot_comfyui.safetensors` exists, select it and use `stream`;
 - otherwise stream the ordinary branch.
 
@@ -160,7 +160,8 @@ The INT8 branch deliberately remains streamed under auto mode. `resident` means 
 - does not keep the complete VDN linear branch resident as an additional model;
 - resolves each block from the selected stage file with a bounded `safe_open` lifetime;
 - never keeps a process-global safetensors mmap handle;
-- when retained runtime buffers are enabled on CUDA, uses one-block lookahead transfer through one bounded worker executor; the executor owns no model tensor cache and each VDN state owns at most one cancellable in-flight result.
+- when retained runtime buffers are enabled on CUDA, uses one-block lookahead transfer through one bounded worker executor; the executor owns no model tensor cache and each VDN state owns at most one cancellable in-flight result;
+- prefetched results are keyed by block index, full device identity and compute dtype, so a lookahead cannot be reused after a placement/dtype change.
 
 ### `branch_weights=resident`
 
@@ -193,7 +194,7 @@ Ownership rules are explicit:
 - cancellation clears that state's retained scratch/prefetch state;
 - branch weights and LoRA factors are **not** stored in this scratch pool.
 
-`retain_buffers=off` uses transient allocation behavior. `auto` enables retention only when free VRAM satisfies the selected branch size + 10 GiB headroom rule inherited from upstream v1.4.
+`retain_buffers=off` uses transient allocation behavior. `auto` applies the selected branch size + 10 GiB headroom rule to the same effective free-VRAM budget after reserving still-unloaded base-model bytes.
 
 CPU tests require retained and transient scan/window/complete-linear-branch paths to match the reference path exactly. Real CUDA allocation and speed still require production GPU validation.
 
@@ -219,7 +220,7 @@ That is structural CPU coverage; it is not a substitute for a real GPU Continuum
 ## Attention backends
 
 - `grouped` is the portable default. Frames sharing the same VDN window are evaluated as grouped dense SDPA calls. Transformer options are forwarded to Comfy's optimized-attention call so normal Comfy composition remains available.
-- `flex` uses PyTorch FlexAttention when available and suitable. Failure falls back to grouped execution for that call without mutating shared VDN state.
+- `flex` uses PyTorch FlexAttention when available and suitable. Failure falls back to grouped execution for that call without mutating shared VDN state. Its process-level BlockMask cache is a bounded 8-entry LRU keyed by full device and layout identity.
 - full-coverage windows use ComfyUI's normal optimized dense-attention path and disable the linear complement because nothing lies outside the softmax window.
 
 See [Benchmarks.md](Benchmarks.md) for historical measurements. Measurements that predate this lifecycle/runtime refactor are not performance validation of the current branch.
@@ -241,7 +242,8 @@ Deliberately replaced in this branch:
 - persistent process-global safetensors handles -> bounded file opens with file-identity invalidation;
 - private process-global GPU branch cache -> Comfy-managed resident branch model or streaming;
 - process-global CUDA scan/KV scratch -> per-VDN execution-leased scratch;
-- per-state immortal prefetch worker -> one bounded tensor-less executor plus at most one state-owned in-flight future.
+- per-state immortal prefetch worker -> one bounded tensor-less executor plus at most one state-owned in-flight future;
+- unbounded/device-type-only Flex BlockMask cache -> bounded 8-entry LRU keyed by full device/layout identity.
 
 This means upstream v1.4 benchmark numbers cannot simply be assigned to this implementation. The optimized lifecycle needs its own real GPU measurements.
 
@@ -258,7 +260,7 @@ The repository CI has two distinct lanes:
 2. **Current Comfy main smoke**
    - checks current Comfy `master` for package import and node registration against the latest API surface.
 
-The official oracle covers window bounds/anchors, frame statistics, all supported delta rules, forward/reverse scans, alpha bridge, feature preparation/short-conv behavior, the complete `BidirectionalLinearBranch`, and the complete reduced `HybridAttention` local-softmax + recurrent-linear orchestration. Separate parity tests cover retained vs transient recurrence/window/complete-linear-branch execution.
+The current expanded pinned suite contains **97 passing tests**. The official oracle covers window bounds/anchors, frame statistics, all supported delta rules, forward/reverse scans, alpha bridge, feature preparation/short-conv behavior, the complete `BidirectionalLinearBranch`, and the complete reduced `HybridAttention` local-softmax + recurrent-linear orchestration. Separate parity tests cover retained vs transient recurrence/window/complete-linear-branch execution, base-residency-aware placement policy, prefetch placement identity and bounded Flex cache behavior.
 
 No large checkpoint or GPU render is run in CI. A green synthetic/oracle suite establishes implementation and lifecycle contracts; it does not establish real-render quality, peak VRAM or wall-clock performance.
 

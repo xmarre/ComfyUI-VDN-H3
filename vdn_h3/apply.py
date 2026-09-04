@@ -176,23 +176,119 @@ def _bypass(new_model, loaded, key_map, modules, sd_keys, strength, hooks):
     return n
 
 
-def _install_injection(new_model, hooks):
-    """All bypass hooks go through ONE PatcherInjection whose eject unwinds in
-    reverse. ComfyUI applies injection sets in list order on load and on unload;
-    with two stacked adapter sets (default + turbo), forward-order eject restores
-    a stale hook as module.forward, and the next load captures that hook as its
-    own "original" -- infinite self-recursion on the second run (observed as
-    RecursionError after a model reload). LIFO eject always restores the true
-    forward, so load/unload cycles are stable.
+def _same_bound_method(left, right):
+    """Identity check that is stable across repeated bound-method attribute reads."""
+    if left is right:
+        return True
+    left_self = getattr(left, "__self__", None)
+    right_self = getattr(right, "__self__", None)
+    left_func = getattr(left, "__func__", None)
+    right_func = getattr(right, "__func__", None)
+    return left_self is right_self and left_func is not None and left_func is right_func
 
-    STACK-PROOFING: every Apply-VDN run clones the patcher but every clone shares
-    ONE inner model, and ComfyUI ejects a clone's injections only when that clone
-    is UNLOADED -- on a big-VRAM card nothing unloads between runs, so re-running
-    with any widget changed (e.g. flipping lora_mode) would otherwise stack
-    ANOTHER full set of bypass hooks on the same modules: 2x, 3x the LoRA delta
-    per rerun, progressively grainy/fried output (merge is immune -- weight
-    patches go through backup/restore). The live hook set is tracked on the
-    shared inner model and ejected before a new set goes in."""
+
+def _bypass_hook_owner(forward):
+    """Return the Comfy bypass hook owning a bound forward, if there is one."""
+    hook_type = getattr(comfy.weight_adapter, "BypassForwardHook", None)
+    owner = getattr(forward, "__self__", None)
+    if isinstance(hook_type, type) and isinstance(owner, hook_type):
+        return owner
+    return None
+
+
+def _inject_hook_stack_safe(hook):
+    """Inject VDN below any already-active Comfy bypass-hook chain.
+
+    ModelPatcher injects and ejects distinct injection keys in the same order. If
+    two providers both replace ``module.forward``, ordinary forward-order teardown
+    can detach an outer hook or resurrect a stale inner one. Keeping VDN innermost
+    makes either provider order recoverable, while preserving the additive adapter
+    math.
+    """
+    if getattr(hook, "original_forward", None) is not None:
+        return
+
+    module = hook.module
+    previous_forward = module.forward
+    hook.inject()  # initializes adapter metadata/device placement as Comfy expects
+
+    outer = _bypass_hook_owner(previous_forward)
+    if outer is None:
+        return
+
+    current = outer
+    seen = set()
+    while True:
+        marker = id(current)
+        if marker in seen:
+            module.forward = previous_forward
+            hook.original_forward = None
+            raise RuntimeError("VDN found a cyclic Comfy bypass-forward chain")
+        seen.add(marker)
+
+        inner_forward = getattr(current, "original_forward", None)
+        inner = _bypass_hook_owner(inner_forward)
+        if inner is None:
+            break
+        current = inner
+
+    # hook.inject() temporarily made VDN outermost. Restore the pre-existing
+    # chain, then splice VDN immediately above its true/base forward instead.
+    module.forward = previous_forward
+    hook.original_forward = inner_forward
+    current.original_forward = hook._bypass_forward
+
+
+def _eject_hook_stack_safe(hook):
+    """Remove a VDN hook even when another Comfy bypass hook currently wraps it."""
+    original_forward = getattr(hook, "original_forward", None)
+    if original_forward is None:
+        return
+
+    module = hook.module
+    target = hook._bypass_forward
+    current_forward = module.forward
+
+    if _same_bound_method(current_forward, target):
+        module.forward = original_forward
+        hook.original_forward = None
+        return
+
+    current = _bypass_hook_owner(current_forward)
+    seen = set()
+    while current is not None:
+        marker = id(current)
+        if marker in seen:
+            raise RuntimeError("VDN found a cyclic Comfy bypass-forward chain during eject")
+        seen.add(marker)
+
+        inner_forward = getattr(current, "original_forward", None)
+        if _same_bound_method(inner_forward, target):
+            current.original_forward = original_forward
+            hook.original_forward = None
+            return
+        current = _bypass_hook_owner(inner_forward)
+
+    # Another provider may already have detached this hook by restoring an older
+    # forward. Do not clobber the currently valid chain by resurrecting our stale
+    # original; just mark this VDN hook inactive.
+    hook.original_forward = None
+
+
+def _install_injection(new_model, hooks):
+    """Install VDN bypass hooks with clone- and cross-provider-safe lifetime rules.
+
+    All VDN hooks live inside one PatcherInjection and are removed in reverse VDN
+    order. In addition, VDN is spliced below any already-active standard Comfy
+    ``BypassForwardHook`` chain and can remove itself from the middle of such a
+    chain. This matters because ModelPatcher currently walks distinct injection
+    keys in insertion order for both inject and eject; another runtime-LoRA
+    provider can therefore still be active when VDN tears down (or vice versa).
+
+    Every Apply-VDN run clones the patcher but clones share one inner model. The
+    live VDN hook set is tracked on that shared model and removed before a fresh
+    VDN set is installed, preventing reruns from accumulating adapter deltas.
+    """
     if not hooks:
         return
     owner = new_model.model      # shared by every clone of this model
@@ -201,14 +297,19 @@ def _install_injection(new_model, hooks):
         old = getattr(owner, "_vdn_live_hooks", None)
         if old:
             for hook in reversed(old):
-                hook.eject()
-        for hook in hooks:
-            hook.inject()
+                _eject_hook_stack_safe(hook)
+        try:
+            for hook in hooks:
+                _inject_hook_stack_safe(hook)
+        except Exception:
+            for hook in reversed(hooks):
+                _eject_hook_stack_safe(hook)
+            raise
         owner._vdn_live_hooks = hooks
 
     def eject_all(model_patcher):
         for hook in reversed(hooks):
-            hook.eject()
+            _eject_hook_stack_safe(hook)
         if getattr(owner, "_vdn_live_hooks", None) is hooks:
             owner._vdn_live_hooks = None
 
@@ -321,4 +422,3 @@ def _inject_adaln_egrid(new_model, dm, lora, adaln_modules, strength):
         new_model.add_object_patch(
             key + ".forward",
             _make_adaln_forward(new_model.get_model_object(key), a, b, shared, tt, e))
-

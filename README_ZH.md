@@ -88,14 +88,14 @@ hf download OpenVDN/vdn-minimax-h3 \
 
 - 使用 Comfy 公共 `ModelPatcher.add_weight_wrapper()` / `weight_function` 生命周期；
 - 不替换、遍历、拼接或恢复 LoRA 目标的 `module.forward`；
-- 不安装 VDN `PatcherInjection`、`_vdn_live_hooks` 或私有 forward owner；
+- 不安装 VDN LoRA `PatcherInjection`、`_vdn_live_hooks` 或私有 forward owner；
 - base parameter 保持未合并；
-- LoRA A/B 放在独立的 Comfy-managed additional `ModelPatcher` 中，而不是私有 GPU cache；
+- LoRA factor 放在独立的 Comfy-managed additional `ModelPatcher` 中，而不是私有 GPU cache；
 - 同一目标的 Stage-B/Turbo 项合并为一个 runtime wrapper；
 - 每次只创建当前 layer 的临时 compute weight；
 - `B @ A` 按输出行分块计算，再按 merge 风格执行 scale/add；额外 delta 临时 buffer 上限为 8 MiB，而不是另一份完整 weight；
-- 保留检查点 A/B 存储 dtype，并使用 Comfy 选择的 LoRA compute dtype；
-- 每次不同 Apply 配置使用不同 runtime ownership key，避免 Comfy 将不同 strength/config 错认成相同已加载权重状态；同一次 Apply 的 clone 仍保持等价。
+- 保留检查点 factor 存储 dtype，并使用 Comfy 选择的 LoRA compute dtype；
+- 每次不同 Apply 配置使用不同 runtime ownership key，避免不同 strength/config 被错认成相同已加载状态；同一次 Apply 的 clone 仍保持等价。
 
 这样恢复低显存 adapter 选项，同时不再引入曾导致 Continuum 在 chunk 2 第一次 transformer evaluation 之前递归崩溃的跨 provider `module.forward` 链。
 
@@ -105,24 +105,51 @@ hf download OpenVDN/vdn-minimax-h3 \
 
 ## Curve / pruned MiniMax-H3
 
-部分 H3 检查点把 dense time embedding 折叠为 `adaln_t_table`。完整宽度 AdaLN LoRA 一般不能无损投影到较小 curve basis。
+部分 MiniMax-H3 检查点把 dense AdaLN timestep 表示压缩为 `adaln_t_table` 等小型坐标表。支持的 pruned 模型谱系使用如下 affine 近似：
 
-本节点不会丢弃或近似这些学习权重。它恢复匹配的 dense time-embedder 输入并执行原始 low-rank AdaLN delta，base curve projection 保持不变。AdaLN A/B 与普通 runtime adapter 项使用同一个 Comfy-managed low-rank model。
-
-解析顺序：
-
-1. VDN stage 下的 `dense_time_embedder.safetensors`；或
-2. `models/diffusion_models` 中匹配的 dense MiniMax-H3 checkpoint。
-
-提取工具：
-
-```bash
-python tools/extract_h3_time_embedder.py \
-  <path-to-dense-h3.safetensors> \
-  <ComfyUI>/models/vdn/<stage>/dense_time_embedder.safetensors
+```text
+dense(t) ≈ mean + curve(t) @ basis
 ```
 
-无法确认匹配 dense embedder 时明确失败，不会静默丢失 AdaLN 参数。
+发布版 VDN Turbo adapter 中包含完整宽度 AdaLN LoRA。对于一个 `B @ A` 更新，VDN 现在只做一次 pruning-native 投影：
+
+```text
+A_pruned   = A @ basis.T
+bias_delta = B @ (A @ mean)
+```
+
+两个部分都必须保留；常数 `bias_delta` 不能省略，也不会静默丢弃。
+
+投影使用存储的 adapter 和 pruning-affine tensor 在 float64 中一次性计算。投影后的 A 和常数 bias offset 保存为 float32；B 保留检查点存储 dtype，直到 Comfy 选择本次调用的 compute dtype。这不会在 pruned base 已有的 affine 近似之外再引入新的模型近似，但也不声称与原始未剪枝 dense timestep MLP bitwise 相同。
+
+运行时仍直接使用 pruned 模型的原生小宽度 AdaLN：
+
+- sampling loop 中不重建或执行 dense timestep MLP；
+- 不替换 AdaLN `forward`；
+- `merge` 把投影后的 low-rank weight 更新和常数 bias 作为普通 Comfy patch；
+- `bypass` 把投影后的 A/B 和 float32 bias offset 放进同一个 Comfy-managed additional model，并通过 Comfy weight/bias wrapper 应用。
+
+### pruning affine 的解析
+
+必须使用与当前 `adaln_t_table` 对应的**准确** `adaln_basis` + `adaln_mean`；不同模型的 basis 不能互换。解析顺序：
+
+1. 当前 VDN stage 下的 `adaln_affine.safetensors`；
+2. 当前选择的 diffusion checkpoint 及其同目录 sibling `.safetensors`；
+3. `models/diffusion_models` 中其它已安装候选。
+
+已安装 checkpoint 候选必须能证明其 curve table 与当前 base 相同；table 不匹配或无法验证的 affine 会 fail closed。
+
+对于修复后的 pruned MiniMax-H3 Comfy 模型谱系，BF16 源文件可以保留 `adaln_basis` 和 `adaln_mean`，而 INT8 派生文件可能有意省略这些原生 inference 不需要的辅助 tensor。如果匹配 BF16 文件仍与所选 INT8/INT8-ConvRot 文件放在同一目录，VDN 会自动读取它的少量 affine tensor/table，不会加载整份 BF16 模型。
+
+如果不保留 BF16 sibling，只需一次性提取约 97 KB 的 companion：
+
+```bash
+python tools/extract_h3_adaln_affine.py \
+  <path-to-matching-pruned-bf16.safetensors> \
+  <ComfyUI>/models/vdn/<stage>/adaln_affine.safetensors
+```
+
+源文件含 curve table 时，工具会写入 table identity。若无法建立可信的匹配 affine，VDN 会明确报错，而不是丢掉 Turbo 的 51 个 AdaLN 更新或猜测 basis。
 
 ## VDN branch 权重驻留
 
@@ -141,7 +168,7 @@ INT8 branch 在 auto 模式下仍然 **stream**。这里的 `resident` 必须是
 - 不常驻完整 branch；
 - 每个 block 需要时才从 stage 解析；
 - `safe_open` 生命周期限制在单次读取内，不保留 process-global mmap；
-- CUDA + retained buffers 时使用一-block lookahead；全局只有一个有界 worker executor，它不保存模型 tensor cache，每个 VDN state 最多只有一个可取消的 in-flight result；
+- CUDA + retained buffers 时使用 one-block lookahead；全局只有一个有界 worker executor，它不保存模型 tensor cache，每个 VDN state 最多只有一个可取消的 in-flight result；
 - prefetch identity 包含 block index、完整 device 和 compute dtype，因此 placement/dtype 改变后不会复用旧 lookahead 结果。
 
 ### `branch_weights=resident`
@@ -183,9 +210,9 @@ CPU parity test 要求 retained/transient scan、window 和完整 linear-branch 
 
 VDN 混合注意力本身通过 Comfy object patch 替换 `diffusion_model.blocks.*.attn.forward`。如果其它扩展已经占用同一 attention object-patch 目标，VDN 会明确拒绝冲突。
 
-这与 LoRA runtime 模式不同：`lora_mode=bypass` 不改写 LoRA 目标 `module.forward`，而是使用 weight wrapper。
+这与 LoRA runtime 模式不同：`lora_mode=bypass` 不改写 LoRA 目标 `module.forward`，而是使用 weight/bias wrapper。Curve AdaLN 的常数项也通过 bias wrapper，而不是 forward patch。
 
-回归测试覆盖重复 `ModelPatcher` clone/load/unload、pseudo-Continuum `preprocess_text_embeds -> token_refiner.fc1 -> transformer` 顺序、外部 forward owner、不同 strength/config reload、常驻 base weight 不变及无 2x/3x 累积。
+回归测试覆盖重复 `ModelPatcher` clone/load/unload、pseudo-Continuum `preprocess_text_embeds -> token_refiner.fc1 -> transformer` 顺序、外部 forward owner、不同 strength/config reload、常驻 base weight 不变、无 2x/3x 累积、curve affine constant bias、错误 table 拒绝和文件替换 invalidation。
 
 ## Attention backend
 
@@ -224,13 +251,22 @@ CI 两个 lane：
    - OpenVDN `b8cb28fbfca0266d1c7742a9f25ab8b58191de97`
    - 直接导入并比较 OpenVDN 数学路径；
    - 直接实例化并比较发布版 `HybridAttention` orchestration；
-   - adapter、ModelSpec/checkpoint、curve、custom/quantized weight、runtime-buffer、placement policy 和 lifecycle 回归。
+   - adapter、ModelSpec/checkpoint、curve-affine、custom/quantized weight、runtime-buffer、placement policy 和 lifecycle 回归。
 2. **Current Comfy main smoke**
    - 当前 Comfy `master` 的包导入和节点注册。
 
-当前扩展 pinned suite 为 **97 个通过测试**。官方 oracle 覆盖 window/anchor、frame statistics、全部支持的 delta rule、双向 scan、alpha bridge、feature/short-conv、完整 `BidirectionalLinearBranch` 和 reduced `HybridAttention`。另有 retained/transient parity、base-residency-aware placement policy、prefetch placement identity 和 bounded Flex cache 回归。
+扩展后的 pinned suite 为 **110 个测试**，包括 production-shaped KJ selected-INT8 + matching-BF16-sibling affine 解析回归。官方 oracle 覆盖 window/anchor、frame statistics、全部支持的 delta rule、双向 scan、alpha bridge、feature/short-conv、完整 `BidirectionalLinearBranch` 和 reduced `HybridAttention`；其它测试覆盖 fused adapter naming、curve affine 投影及 constant bias、wrong-table rejection、file replacement invalidation、retained/transient parity 和 runtime lifecycle。
 
 绿色 CI 不等于真实渲染质量、峰值 VRAM 或 wall-clock 性能验证。
+
+## 兼容要求
+
+- 当前 ComfyUI MiniMax-H3 fused `qkv_proj` 实现；
+- runtime `bypass` 的 weight 目标需要 Comfy `weight_function`；projected curve AdaLN bias 还需要 `bias_function`；
+- curve/pruned base + full-width released AdaLN adapter 需要与当前 `adaln_t_table` 匹配的 verified `adaln_basis` + `adaln_mean`；
+- 官方 VDN v2 ModelSpec/hybrid-transform contract；
+- stage/base block 数和所有启用 branch tensor shape 必须匹配；
+- malformed/incomplete/unsupported/stale-replaced 资源会提前 fail closed。
 
 ## 许可证与来源
 

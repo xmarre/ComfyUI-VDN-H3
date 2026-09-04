@@ -10,25 +10,32 @@ that cannot acquire that lease receives an isolated transient pool instead, so s
 scratch is never raced across ModelPatcher clones or threads.
 
 Branch *weights* do not live here. They remain either bounded streamed checkpoint
-descriptors or a ComfyUI-managed additional ModelPatcher.
+descriptors or a ComfyUI-managed additional ModelPatcher. The only process-global
+runtime object is one bounded worker executor; it owns no model tensors or cache.
 """
 from __future__ import annotations
 
 import collections
+import concurrent.futures
 import contextlib
 import contextvars
-import queue
+import logging
 import threading
 
 import torch
 
 
-_MAX_SCAN_BANKS = 4
-_MAX_DELTA_SCRATCH = 4
+_log = logging.getLogger("comfy.vdn")
+_MAX_SCAN_BANKS = 1
+_MAX_DELTA_SCRATCH = 1
 _MAX_WINDOW_PLANS = 8
-_MAX_KV_SCRATCH = 4
-_MAX_ACTIVATION_SCRATCH = 2
+_MAX_KV_SCRATCH = 1
+_MAX_ACTIVATION_SCRATCH = 1
 _ACTIVE_BUFFERS = contextvars.ContextVar("vdn_active_runtime_buffers", default=None)
+# One worker is enough for one-block lookahead. It never stores branch weights itself;
+# each RuntimeBuffers owns at most one Future/result and drops it on reset.
+_PREFETCH_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="vdn-branch-prefetch")
 
 
 def current_runtime_buffers():
@@ -46,30 +53,13 @@ def _bounded_put(mapping, key, value, limit):
 
 
 class _StreamPrefetcher:
-    """One-block lookahead using a private CUDA stream and one in-flight result."""
+    """One cancellable in-flight block transfer; no per-state worker/thread leak."""
 
     def __init__(self):
-        self._queue = queue.Queue(maxsize=1)
-        self._done = {}
-        self._inflight = set()
         self._lock = threading.Lock()
         self._generation = 0
-        self._stream = None
-        self._thread = threading.Thread(
-            target=self._worker, daemon=True, name="vdn-branch-prefetch")
-        self._thread.start()
-
-    def request(self, index, fetch):
-        with self._lock:
-            if index in self._done or index in self._inflight:
-                return
-            generation = self._generation
-            self._inflight.add(index)
-        try:
-            self._queue.put_nowait((generation, index, fetch))
-        except queue.Full:
-            with self._lock:
-                self._inflight.discard(index)
+        self._future = None
+        self._index = None
 
     @staticmethod
     def _record_stream(tensor, stream):
@@ -88,32 +78,53 @@ class _StreamPrefetcher:
             except Exception:
                 pass
 
-    def _worker(self):
-        while True:
-            generation, index, fetch = self._queue.get()
-            try:
-                with self._lock:
-                    if generation != self._generation:
-                        continue
-                if self._stream is None:
-                    self._stream = torch.cuda.Stream()
-                with torch.cuda.stream(self._stream):
-                    weights = fetch()
-                    event = torch.cuda.Event()
-                    event.record(self._stream)
-                with self._lock:
-                    if generation == self._generation:
-                        self._done[index] = (weights, event)
-            finally:
-                with self._lock:
-                    self._inflight.discard(index)
+    @staticmethod
+    def _fetch(generation, index, fetch):
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            weights = fetch()
+            event = torch.cuda.Event()
+            event.record(stream)
+        return generation, index, weights, event
+
+    def request(self, index, fetch):
+        with self._lock:
+            if self._future is not None and not self._future.done():
+                return
+            # A completed result is consumed only by take(). Do not overwrite it with
+            # a later block before the execution reaches its intended target.
+            if self._future is not None and self._index == index:
+                return
+            generation = self._generation
+            self._index = index
+            self._future = _PREFETCH_EXECUTOR.submit(
+                self._fetch, generation, index, fetch)
 
     def take(self, index):
         with self._lock:
-            hit = self._done.pop(index, None)
-        if hit is None:
+            future = self._future
+            target = self._index
+            generation = self._generation
+        if future is None or target != index:
             return None
-        weights, event = hit
+        try:
+            got_generation, got_index, weights, event = future.result()
+        except Exception as exc:
+            _log.warning(
+                "[vdn] branch prefetch for block %s failed (%s); using synchronous "
+                "streaming for this block", index, exc)
+            with self._lock:
+                if self._future is future:
+                    self._future = None
+                    self._index = None
+            return None
+        with self._lock:
+            if (self._future is future and got_generation == self._generation
+                    and generation == self._generation and got_index == index):
+                self._future = None
+                self._index = None
+            else:
+                return None
         current = torch.cuda.current_stream()
         current.wait_event(event)
         for tensor in weights.values():
@@ -123,13 +134,11 @@ class _StreamPrefetcher:
     def reset(self):
         with self._lock:
             self._generation += 1
-            self._done.clear()
-            self._inflight.clear()
-        try:
-            while True:
-                self._queue.get_nowait()
-        except queue.Empty:
-            pass
+            future = self._future
+            self._future = None
+            self._index = None
+        if future is not None:
+            future.cancel()
 
 
 class RuntimeBuffers:

@@ -1,0 +1,284 @@
+"""State-owned transient/retained runtime resources for VDN-H3.
+
+The upstream v1.4 performance work showed that repeatedly allocating scan banks,
+window gather buffers and activation copies costs meaningful time.  Those buffers
+are useful, but process-global CUDA caches make ownership and cancellation ambiguous.
+
+This module keeps the same optimization local to one Apply-VDN result.  The primary
+pool is leased for one diffusion-model execution at a time.  A nested or concurrent
+execution that cannot acquire that lease receives an isolated transient pool instead,
+so shared scratch is never raced across ModelPatcher clones or threads.
+
+Branch *weights* do not live here.  They remain either bounded streamed checkpoint
+descriptors or a ComfyUI-managed additional ModelPatcher.
+"""
+from __future__ import annotations
+
+import collections
+import contextlib
+import contextvars
+import queue
+import threading
+
+import torch
+
+
+_MAX_SCAN_BANKS = 4
+_MAX_DELTA_SCRATCH = 4
+_MAX_WINDOW_PLANS = 8
+_MAX_KV_SCRATCH = 4
+_MAX_ACTIVATION_SCRATCH = 2
+
+
+def _bounded_put(mapping, key, value, limit):
+    if key in mapping:
+        mapping.pop(key)
+    mapping[key] = value
+    while len(mapping) > limit:
+        mapping.popitem(last=False)
+    return value
+
+
+class _StreamPrefetcher:
+    """One-block lookahead using a private CUDA stream and one in-flight result."""
+
+    def __init__(self):
+        self._queue = queue.Queue(maxsize=1)
+        self._done = {}
+        self._inflight = set()
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._stream = None
+        self._thread = threading.Thread(
+            target=self._worker, daemon=True, name="vdn-branch-prefetch")
+        self._thread.start()
+
+    def request(self, index, fetch):
+        with self._lock:
+            if index in self._done or index in self._inflight:
+                return
+            generation = self._generation
+            self._inflight.add(index)
+        try:
+            self._queue.put_nowait((generation, index, fetch))
+        except queue.Full:
+            with self._lock:
+                self._inflight.discard(index)
+
+    @staticmethod
+    def _record_stream(tensor, stream):
+        seen = [tensor]
+        inner = getattr(tensor, "_qdata", None)
+        if isinstance(inner, torch.Tensor):
+            seen.append(inner)
+        params = getattr(tensor, "_params", None)
+        for name in ("scale", "orig_weight", "bias"):
+            child = getattr(params, name, None)
+            if isinstance(child, torch.Tensor):
+                seen.append(child)
+        for item in seen:
+            try:
+                item.record_stream(stream)
+            except Exception:
+                pass
+
+    def _worker(self):
+        while True:
+            generation, index, fetch = self._queue.get()
+            try:
+                with self._lock:
+                    if generation != self._generation:
+                        continue
+                if self._stream is None:
+                    self._stream = torch.cuda.Stream()
+                with torch.cuda.stream(self._stream):
+                    weights = fetch()
+                    event = torch.cuda.Event()
+                    event.record(self._stream)
+                with self._lock:
+                    if generation == self._generation:
+                        self._done[index] = (weights, event)
+            finally:
+                with self._lock:
+                    self._inflight.discard(index)
+
+    def take(self, index):
+        with self._lock:
+            hit = self._done.pop(index, None)
+        if hit is None:
+            return None
+        weights, event = hit
+        current = torch.cuda.current_stream()
+        current.wait_event(event)
+        for tensor in weights.values():
+            self._record_stream(tensor, current)
+        return weights
+
+    def reset(self):
+        with self._lock:
+            self._generation += 1
+            self._done.clear()
+            self._inflight.clear()
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+
+
+class RuntimeBuffers:
+    """Scratch owned by one execution pool; no model/checkpoint weights are cached."""
+
+    def __init__(self, retain: bool):
+        self.retain = bool(retain)
+        self._scan = collections.OrderedDict()
+        self._delta = collections.OrderedDict()
+        self._plans = collections.OrderedDict()
+        self._kv = collections.OrderedDict()
+        self._activations = collections.OrderedDict()
+        self._prefetcher = None
+
+    def delta_scratch(self, shape, device):
+        if not self.retain:
+            return torch.empty(shape, dtype=torch.float32, device=device)
+        key = (tuple(shape), str(device))
+        hit = self._delta.get(key)
+        if hit is None:
+            hit = torch.empty(shape, dtype=torch.float32, device=device)
+            _bounded_put(self._delta, key, hit, _MAX_DELTA_SCRATCH)
+        else:
+            self._delta.move_to_end(key)
+        return hit
+
+    def scan_banks(self, num_frames, state_shape, dtype, device):
+        shape = (num_frames, *state_shape)
+        if not self.retain:
+            prefix = torch.empty(shape, dtype=dtype, device=device)
+            return prefix, torch.empty_like(prefix)
+        key = (num_frames, tuple(state_shape), str(device), dtype)
+        hit = self._scan.get(key)
+        if hit is None:
+            prefix = torch.empty(shape, dtype=dtype, device=device)
+            hit = (prefix, torch.empty_like(prefix))
+            _bounded_put(self._scan, key, hit, _MAX_SCAN_BANKS)
+        else:
+            self._scan.move_to_end(key)
+        return hit
+
+    def activation_scratch(self, video_rows, text_rows, heads, head_dim, device, dtype):
+        if not self.retain:
+            return None
+        key = (video_rows, text_rows, heads, head_dim, str(device), dtype)
+        hit = self._activations.get(key)
+        if hit is None:
+            vshape = (video_rows, heads, head_dim)
+            tshape = (text_rows, heads, head_dim)
+            hit = {
+                "q": torch.empty(vshape, device=device, dtype=dtype),
+                "k": torch.empty(vshape, device=device, dtype=dtype),
+                "v": torch.empty(vshape, device=device, dtype=dtype),
+                "tk": torch.empty(tshape, device=device, dtype=dtype),
+                "tv": torch.empty(tshape, device=device, dtype=dtype),
+            }
+            _bounded_put(
+                self._activations, key, hit, _MAX_ACTIVATION_SCRATCH)
+        else:
+            self._activations.move_to_end(key)
+        return hit
+
+    def window_plan(self, key, builder):
+        if not self.retain:
+            return builder()
+        hit = self._plans.get(key)
+        if hit is None:
+            hit = builder()
+            _bounded_put(self._plans, key, hit, _MAX_WINDOW_PLANS)
+        else:
+            self._plans.move_to_end(key)
+        return hit
+
+    def kv_scratch(self, rows, heads, head_dim, device, dtype):
+        shape = (rows, heads, head_dim)
+        if not self.retain:
+            return (
+                torch.empty(shape, device=device, dtype=dtype),
+                torch.empty(shape, device=device, dtype=dtype),
+            )
+        key = (str(device), dtype, heads, head_dim)
+        pair = self._kv.get(key)
+        need = rows * heads * head_dim
+        if pair is None or pair[0].numel() < need:
+            pair = (
+                torch.empty(need, device=device, dtype=dtype),
+                torch.empty(need, device=device, dtype=dtype),
+            )
+            _bounded_put(self._kv, key, pair, _MAX_KV_SCRATCH)
+        else:
+            self._kv.move_to_end(key)
+        return (
+            pair[0][:need].view(shape),
+            pair[1][:need].view(shape),
+        )
+
+    def prefetch_take(self, index):
+        if not self.retain or not torch.cuda.is_available():
+            return None
+        if self._prefetcher is None:
+            return None
+        return self._prefetcher.take(index)
+
+    def prefetch_request(self, index, fetch):
+        if not self.retain or not torch.cuda.is_available():
+            return
+        if self._prefetcher is None:
+            self._prefetcher = _StreamPrefetcher()
+        self._prefetcher.request(index, fetch)
+
+    def clear(self):
+        self._scan.clear()
+        self._delta.clear()
+        self._plans.clear()
+        self._kv.clear()
+        self._activations.clear()
+        if self._prefetcher is not None:
+            self._prefetcher.reset()
+
+    def retained_counts(self):
+        return {
+            "scan": len(self._scan),
+            "delta": len(self._delta),
+            "plans": len(self._plans),
+            "kv": len(self._kv),
+            "activations": len(self._activations),
+        }
+
+
+class RuntimeBufferOwner:
+    """Lease one retained pool; concurrent/nested executions get transient scratch."""
+
+    def __init__(self, retain: bool):
+        self.retain = bool(retain)
+        self._primary = RuntimeBuffers(self.retain)
+        self._lease = threading.Lock()
+        self._active = contextvars.ContextVar(
+            f"vdn_runtime_buffers_{id(self)}", default=None)
+
+    @contextlib.contextmanager
+    def execution(self):
+        primary = self.retain and self._lease.acquire(blocking=False)
+        buffers = self._primary if primary else RuntimeBuffers(False)
+        token = self._active.set(buffers)
+        try:
+            yield buffers
+        finally:
+            self._active.reset(token)
+            if primary:
+                self._lease.release()
+            else:
+                buffers.clear()
+
+    def current(self):
+        return self._active.get()
+
+    def clear(self):
+        self._primary.clear()

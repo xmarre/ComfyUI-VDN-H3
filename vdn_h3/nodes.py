@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import logging
+import os
+
+import comfy.model_management
 
 from vdn_h3.adapters import convert_adapter
 from vdn_h3.apply import apply_adapters
-from vdn_h3.branch import LinearBranch
 from vdn_h3.hybrid import VDNState, apply_vdn
 from vdn_h3.managed import make_managed_branch_patcher
+from vdn_h3.retained import RuntimeLinearBranch
+import vdn_h3.policy as policy
 import vdn_h3.spec as spec
 
 _log = logging.getLogger("comfy.vdn")
@@ -60,23 +64,43 @@ def _validate_branch_shapes(path, branches, cfg, hidden, heads, head_dim):
         raise RuntimeError(f"VDN checkpoint/base shape mismatch in {path}: {preview}")
 
 
+def _free_vram():
+    device = comfy.model_management.get_torch_device()
+    return comfy.model_management.get_free_memory(device)
+
+
 def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
                attention_backend, verbose, apply_turbo_adapter=True,
-               cfg_overrides=None, fast_kernels=False):
+               cfg_overrides=None, fast_kernels=False, retain_buffers="auto"):
     if lora_mode not in ("merge", "bypass"):
         raise ValueError(f"lora_mode must be merge or bypass, got {lora_mode!r}")
     if branch_weights == "cache_gpu":
-        # Migration for old serialized workflows; the UI now calls this resident and
-        # gives ownership to a Comfy additional ModelPatcher.
+        # Serialized v1.3/v1.4 workflows used this name. The safe equivalent is a
+        # Comfy-owned resident additional model, not VDN's former private GPU cache.
         _log.warning("[vdn] branch_weights=cache_gpu is deprecated; using resident")
         branch_weights = "resident"
-    if branch_weights not in ("stream", "resident"):
-        raise ValueError(f"branch_weights must be stream or resident, got {branch_weights!r}")
+    if branch_weights not in ("auto", "stream", "resident"):
+        raise ValueError(
+            f"branch_weights must be auto, stream or resident, got {branch_weights!r}")
+    if retain_buffers not in ("auto", "on", "off"):
+        raise ValueError(
+            f"retain_buffers must be auto, on or off, got {retain_buffers!r}")
 
     path = spec.resolve_vdn_checkpoint(vdn_checkpoint)
-    cfg, branch_weights_by_block, adapters = spec.load_vdn_checkpoint(path)
+    free = _free_vram() if branch_weights == "auto" or retain_buffers == "auto" else None
+    prefer_int8 = False
+    if branch_weights == "auto":
+        branch_weights, prefer_int8 = policy.auto_branch_policy(path, free)
+
+    cfg, branch_weights_by_block, adapters, branch_path = policy.load_vdn_checkpoint(
+        path, prefer_int8=prefer_int8)
     cfg = dict(cfg)
     cfg.setdefault("linear_enabled", True)
+
+    if retain_buffers == "auto":
+        retain = policy.auto_retain_policy(path, prefer_int8, free)
+    else:
+        retain = retain_buffers == "on"
 
     if cfg_overrides:
         changed = {
@@ -114,7 +138,7 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
         path, branch_weights_by_block, cfg, hidden, heads, head_dim)
 
     branches = [
-        LinearBranch(
+        RuntimeLinearBranch(
             weights,
             heads,
             head_dim,
@@ -136,8 +160,14 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
             branch_weights_by_block, model)
 
     state = VDNState(
-        vdn_checkpoint, cfg, branches, heads, head_dim,
-        managed_weights=managed_weights)
+        vdn_checkpoint,
+        cfg,
+        branches,
+        heads,
+        head_dim,
+        managed_weights=managed_weights,
+        retain_buffers=retain,
+    )
     state.softmax_backend = attention_backend
 
     new_model = model.clone()
@@ -173,10 +203,20 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
     )
     _log.info(
         "[vdn] %s applied: blocks=%d radius=%d chunk=%d anchors=%s rule=%s "
-        "branch=%s backend=%s lora_mode=%s adapters=%s",
-        vdn_checkpoint, len(branches), cfg["radius"], cfg["chunk"],
-        cfg["anchor_frames"], cfg["delta_rule"], branch_weights,
-        attention_backend, lora_mode, report)
+        "branch=%s/%s buffers=%s backend=%s lora_mode=%s adapters=%s",
+        vdn_checkpoint,
+        len(branches),
+        cfg["radius"],
+        cfg["chunk"],
+        cfg["anchor_frames"],
+        cfg["delta_rule"],
+        os.path.basename(branch_path),
+        branch_weights,
+        "retained" if retain else "transient",
+        attention_backend,
+        lora_mode,
+        report,
+    )
     return (new_model,)
 
 
@@ -200,15 +240,23 @@ class ApplyVDNH3:
                 "tooltip": "merge uses normal Comfy weight patches. bypass is the "
                            "low-VRAM runtime mode: Comfy weight_function wrappers apply "
                            "the LoRA per layer without VDN touching module.forward."}),
-            "branch_weights": (["stream", "resident"], {
-                "default": "stream",
-                "tooltip": "stream resolves one branch block from the checkpoint when "
-                           "needed. resident registers branch weights as a ComfyUI "
-                           "additional model so VRAM ownership/load/offload is managed."}),
+            "branch_weights": (["auto", "stream", "resident"], {
+                "default": "auto",
+                "tooltip": "auto: resident BF16 when free VRAM exceeds 1.5x branch "
+                           "size + 4 GiB; otherwise stream and prefer the native INT8 "
+                           "ConvRot branch when available. stream resolves one block "
+                           "at a time with safe one-block prefetch when buffers are "
+                           "retained. resident is a Comfy-managed additional model."}),
+            "retain_buffers": (["auto", "on", "off"], {
+                "default": "auto",
+                "tooltip": "auto retains VDN-owned scratch when free VRAM is at least "
+                           "the selected branch size + 10 GiB. Retained scratch is "
+                           "leased per model execution; concurrent/nested runs fall "
+                           "back to isolated transient storage."}),
             "verbose": ("BOOLEAN", {"default": False}),
             "attention_backend": (["grouped", "flex"], {
                 "default": "grouped",
-                "tooltip": "grouped is the portable exact-window fallback; flex uses "
+                "tooltip": "grouped is the portable exact-window path; flex uses "
                            "PyTorch FlexAttention and falls back to grouped on failure."}),
         }}
 
@@ -220,11 +268,12 @@ class ApplyVDNH3:
         "native MiniMax-H3 MODEL using checkpoint-bound architecture settings.")
 
     def apply(self, model, vdn_checkpoint, apply_turbo_adapter, strength, lora_mode,
-              branch_weights, attention_backend, verbose):
+              branch_weights, retain_buffers, attention_backend, verbose):
         return _apply_vdn(
             model, vdn_checkpoint, strength, lora_mode, branch_weights,
             attention_backend, verbose,
-            apply_turbo_adapter=apply_turbo_adapter)
+            apply_turbo_adapter=apply_turbo_adapter,
+            retain_buffers=retain_buffers)
 
 
 class ApplyVDNH3Advanced:
@@ -244,7 +293,8 @@ class ApplyVDNH3Advanced:
                 "default": "merge",
                 "tooltip": "bypass uses the safe runtime low-VRAM weight-wrapper path; "
                            "it does not install forward hooks/chains."}),
-            "branch_weights": (["stream", "resident"], {"default": "stream"}),
+            "branch_weights": (["auto", "stream", "resident"], {"default": "auto"}),
+            "retain_buffers": (["auto", "on", "off"], {"default": "auto"}),
             "verbose": ("BOOLEAN", {"default": False}),
             "attention_backend": (["grouped", "flex"], {"default": "grouped"}),
             "architecture_mode": (["checkpoint", "override"], {
@@ -282,10 +332,10 @@ class ApplyVDNH3Advanced:
         "are applied only after selecting architecture_mode=override.")
 
     def apply(self, model, vdn_checkpoint, apply_turbo_adapter, stage_b_strength,
-              turbo_strength, lora_mode, branch_weights, attention_backend, verbose,
-              architecture_mode="checkpoint", window_radius=1, window_chunk=5,
-              anchor_frames="both", text_state=True, linear_branch=True,
-              fast_kernels=False):
+              turbo_strength, lora_mode, branch_weights, retain_buffers,
+              attention_backend, verbose, architecture_mode="checkpoint",
+              window_radius=1, window_chunk=5, anchor_frames="both", text_state=True,
+              linear_branch=True, fast_kernels=False):
         if architecture_mode not in ("checkpoint", "override"):
             raise ValueError(f"invalid architecture_mode {architecture_mode!r}")
         overrides = None
@@ -303,7 +353,8 @@ class ApplyVDNH3Advanced:
             attention_backend, verbose,
             apply_turbo_adapter=apply_turbo_adapter,
             cfg_overrides=overrides,
-            fast_kernels=fast_kernels)
+            fast_kernels=fast_kernels,
+            retain_buffers=retain_buffers)
 
 
 NODE_CLASS_MAPPINGS = {

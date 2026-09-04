@@ -7,8 +7,10 @@ ComfyUI ``weight_function``/``add_weight_wrapper`` plus a managed additional mod
 for the low-rank A/B tensors. VDN never traverses, replaces, splices or restores
 LoRA-target ``module.forward`` methods.
 
-Full-width AdaLN LoRAs on a curve/pruned H3 base are reconstructed at runtime by
-:mod:`vdn_h3.curve`; their A/B factors share the same Comfy-managed low-rank model.
+Full-width AdaLN LoRAs on a curve/pruned H3 base are projected once through the
+exact pruning affine (basis + mean). Their weight term then targets the native
+small AdaLN coordinate projection and their essential constant term targets its
+float32 bias. No dense timestep MLP or AdaLN forward object patch is required.
 """
 from __future__ import annotations
 
@@ -20,15 +22,9 @@ import torch
 import comfy.float
 import comfy.lora
 import comfy.model_management
-import comfy.patcher_extension
 import comfy.utils
 
-from vdn_h3.curve import (
-    CurveAdalnState,
-    find_dense_time_embedder,
-    make_curve_adaln_forward,
-    make_dense_curve_wrapper,
-)
+from vdn_h3.curve_affine import find_curve_affine, project_curve_terms
 from vdn_h3.managed import make_managed_runtime_lora_patcher
 
 _log = logging.getLogger("comfy.vdn")
@@ -94,6 +90,38 @@ def _native_patch_adapter(new_model, converted, strength: float) -> int:
     return len(accepted)
 
 
+def _native_patch_projected_curve(new_model, terms_by_module, bias_terms_by_module):
+    """Apply projected curve LoRAs + their constant terms through normal patches."""
+    weight_patches = 0
+    bias_patches = 0
+    state_keys = set(new_model.model.state_dict().keys())
+
+    # Keep projected weight updates low-rank and let Comfy own their normal LoRA
+    # materialization lifecycle. Multiple adapters can target the same module; each
+    # add_patches call appends rather than replacing the prior patch.
+    for module in sorted(terms_by_module):
+        for term in terms_by_module[module]:
+            weight_patches += _native_patch_adapter(new_model, {module: term}, 1.0)
+
+    for module in sorted(bias_terms_by_module):
+        key = f"diffusion_model.{module}.bias"
+        if key not in state_keys:
+            raise RuntimeError(f"VDN projected AdaLN bias target is absent from the base: {key}")
+        base_bias = comfy.utils.get_attr(new_model.model, key)
+        for offset, scale in bias_terms_by_module[module]:
+            if tuple(offset.shape) != tuple(base_bias.shape):
+                raise RuntimeError(
+                    f"VDN projected AdaLN bias {key} has {tuple(offset.shape)}, but "
+                    f"the base bias is {tuple(base_bias.shape)}")
+            if scale == 0.0:
+                continue
+            accepted = set(new_model.add_patches({key: (offset,)}, float(scale)))
+            if key not in accepted:
+                raise RuntimeError(f"ModelPatcher rejected VDN projected AdaLN bias: {key}")
+            bias_patches += 1
+    return weight_patches, bias_patches
+
+
 class _RuntimeLoRAWeight:
     """Stateless runtime weight wrapper with bounded delta temporary memory."""
 
@@ -139,6 +167,36 @@ class _RuntimeLoRAWeight:
         return out
 
 
+class _RuntimeBiasWeight:
+    """Stateless runtime wrapper for projected pruned-AdaLN constant terms."""
+
+    __slots__ = ("key", "module", "source", "_vdn_runtime_bias")
+
+    def __init__(self, key: str, module: str, source):
+        self.key = key
+        self.module = module
+        self.source = source
+        self._vdn_runtime_bias = True
+
+    def __call__(self, bias):
+        if not isinstance(bias, torch.Tensor) or not bias.is_floating_point():
+            raise RuntimeError(
+                f"VDN runtime AdaLN bias for {self.key} expected a floating tensor; "
+                f"got {type(bias).__name__} / {getattr(bias, 'dtype', None)}")
+        compute_dtype = comfy.model_management.lora_compute_dtype(bias.device)
+        if compute_dtype is None:
+            compute_dtype = bias.dtype
+        out = bias.to(dtype=compute_dtype, copy=True)
+        for offset, scale in self.source.bias_terms_on(
+                self.module, out.device, compute_dtype):
+            if scale != 0.0:
+                out.add_(offset, alpha=float(scale))
+        if out.dtype != bias.dtype:
+            out = comfy.float.stochastic_rounding(
+                out, bias.dtype, seed=comfy.utils.string_to_seed(self.key))
+        return out
+
+
 def _validate_runtime_weight_targets(new_model, terms_by_module):
     state_keys = set(new_model.model.state_dict().keys())
     for module in sorted(terms_by_module):
@@ -168,6 +226,26 @@ def _validate_runtime_weight_targets(new_model, terms_by_module):
                     f"weight is {expected_shape}")
 
 
+def _validate_runtime_bias_targets(new_model, terms_by_module):
+    state_keys = set(new_model.model.state_dict().keys())
+    for module in sorted(terms_by_module):
+        key = f"diffusion_model.{module}.bias"
+        if key not in state_keys:
+            raise RuntimeError(f"VDN runtime AdaLN bias target is absent from the base: {key}")
+        owner_key = f"diffusion_model.{module}"
+        owner = comfy.utils.get_attr(new_model.model, owner_key)
+        if not hasattr(owner, "bias_function"):
+            raise RuntimeError(
+                f"VDN runtime AdaLN bias requires Comfy's bias_function contract, but "
+                f"{owner_key} ({type(owner).__name__}) does not expose it")
+        bias = comfy.utils.get_attr(new_model.model, key)
+        for offset, _scale in terms_by_module[module]:
+            if tuple(offset.shape) != tuple(bias.shape):
+                raise RuntimeError(
+                    f"VDN runtime AdaLN bias {key} has {tuple(offset.shape)}, but "
+                    f"the base bias is {tuple(bias.shape)}")
+
+
 def _install_runtime_weight_adapters(new_model, terms_by_module, managed):
     if not terms_by_module:
         return 0
@@ -175,57 +253,21 @@ def _install_runtime_weight_adapters(new_model, terms_by_module, managed):
     installed = 0
     for module in sorted(terms_by_module):
         key = f"diffusion_model.{module}.weight"
-        new_model.add_weight_wrapper(
-            key, _RuntimeLoRAWeight(key, module, managed))
+        new_model.add_weight_wrapper(key, _RuntimeLoRAWeight(key, module, managed))
         installed += 1
     return installed
 
 
-def _install_curve_adaln(new_model, dm, stage_path, terms_by_module, managed):
-    """Install exact full-width AdaLN deltas on a curve H3 base."""
+def _install_runtime_bias_adapters(new_model, terms_by_module, managed):
     if not terms_by_module:
-        return None
-    if stage_path is None:
-        raise RuntimeError("VDN curve AdaLN reconstruction requires the stage path")
-    if managed is None:
-        raise RuntimeError("VDN curve AdaLN terms have no managed runtime owner")
-
-    table = getattr(dm, "adaln_t_table", None)
-    if table is None:
-        raise RuntimeError(
-            "MiniMax-H3 was detected as a curve/pruned base but has no adaln_t_table")
-    if getattr(table, "device", None) is not None and table.device.type == "meta":
-        raise RuntimeError(
-            "MiniMax-H3 adaln_t_table is still on the meta device; load the base "
-            "checkpoint before applying VDN")
-    table_cpu = table.detach().to(device="cpu", dtype=torch.float32).clone()
-    embedder, residual = find_dense_time_embedder(stage_path, table_cpu)
-    _log.info("[vdn] curve AdaLN source: %s (base-curve residual %.3e)",
-              embedder.source, residual)
-
-    state = CurveAdalnState()
-    new_model.add_wrapper_with_key(
-        comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
-        "vdn_curve_adaln",
-        make_dense_curve_wrapper(dm, embedder, state),
-    )
-
-    for module in terms_by_module:
-        parent = module.rsplit(".linear", 1)[0]
-        object_key = f"diffusion_model.{parent}.forward"
-        existing = new_model.object_patches.get(object_key)
-        if existing is not None and not getattr(existing, "_vdn_curve_adaln", False):
-            raise RuntimeError(
-                f"VDN needs to patch {object_key} for exact curve AdaLN, but another "
-                "object patch already owns that forward. Apply VDN before the "
-                "conflicting provider or remove that incompatible patch.")
-        base = new_model.get_model_object(f"diffusion_model.{parent}")
-        new_model.add_object_patch(
-            object_key,
-            make_curve_adaln_forward(
-                base, managed, state, managed_module=module),
-        )
-    return embedder.source, residual
+        return 0
+    _validate_runtime_bias_targets(new_model, terms_by_module)
+    installed = 0
+    for module in sorted(terms_by_module):
+        key = f"diffusion_model.{module}.bias"
+        new_model.add_weight_wrapper(key, _RuntimeBiasWeight(key, module, managed))
+        installed += 1
+    return installed
 
 
 def _merge_runtime_terms(*groups):
@@ -278,15 +320,50 @@ def apply_adapters(new_model, converted_by_name, strength, mode="merge",
                 "%d curve AdaLN",
                 name, patched, runtime_count, curve_count)
 
-    managed_terms = _merge_runtime_terms(runtime_terms, curve_terms)
+    projected_curve = {}
+    curve_bias_terms = {}
+    affine = None
+    if curve_terms:
+        if stage_path is None:
+            raise RuntimeError("VDN curve AdaLN projection requires the stage path")
+        table = getattr(dm, "adaln_t_table", None)
+        if table is None:
+            raise RuntimeError(
+                "MiniMax-H3 was detected as a curve/pruned base but has no adaln_t_table")
+        if getattr(table, "device", None) is not None and table.device.type == "meta":
+            raise RuntimeError(
+                "MiniMax-H3 adaln_t_table is still on the meta device; load the base "
+                "checkpoint before applying VDN")
+        affine = find_curve_affine(stage_path, table, base_patcher=new_model)
+        projected_curve, curve_bias_terms = project_curve_terms(curve_terms, affine)
+        _log.info(
+            "[vdn] curve AdaLN affine: %s (%d weight targets + %d float32 bias targets)",
+            affine.source, len(projected_curve), len(curve_bias_terms))
+
+    if mode == "merge" and projected_curve:
+        curve_weight_patches, curve_bias_patches = _native_patch_projected_curve(
+            new_model, projected_curve, curve_bias_terms)
+        report["curve_adaln_projection"] = {
+            "source": affine.source,
+            "mode": "merge",
+            "weight_patches": curve_weight_patches,
+            "bias_patches": curve_bias_patches,
+            "dense_width": int(affine.mean.shape[0]),
+            "curve_width": int(affine.basis.shape[0]),
+        }
+        return report
+
+    if projected_curve:
+        runtime_terms = _merge_runtime_terms(runtime_terms, projected_curve)
+
     managed = None
     managed_bytes = 0
     runtime_owner_key = None
-    if managed_terms:
+    if runtime_terms or curve_bias_terms:
         managed, managed_patcher = make_managed_runtime_lora_patcher(
-            managed_terms, new_model)
+            runtime_terms, new_model, bias_terms_by_module=curve_bias_terms)
         # Core currently does not compare weight_wrapper_patches in
-        # ModelPatcher.clone_has_same_weights(), and it returns early when both
+        # ModelPatcher.clone_has_same_weights(), and it can return early when both
         # patchers have no ordinary weight patches. Give every Apply execution a
         # distinct additional-model key so changing strength/options cannot reuse a
         # still-loaded wrapper set from an older clone. Clones of *this* result keep
@@ -298,21 +375,26 @@ def apply_adapters(new_model, converted_by_name, strength, mode="merge",
 
     runtime_wrappers = _install_runtime_weight_adapters(
         new_model, runtime_terms, managed) if runtime_terms else 0
-    if runtime_wrappers:
+    runtime_bias_wrappers = _install_runtime_bias_adapters(
+        new_model, curve_bias_terms, managed) if curve_bias_terms else 0
+    if runtime_wrappers or runtime_bias_wrappers:
         report["runtime_lowvram"] = {
             "weight_wrappers": runtime_wrappers,
+            "bias_wrappers": runtime_bias_wrappers,
             "forward_hooks": 0,
             "managed_adapter_bytes": managed_bytes,
             "delta_buffer_limit_bytes": _RUNTIME_DELTA_BUFFER_BYTES,
             "owner_key": runtime_owner_key,
         }
 
-    curve_source = _install_curve_adaln(
-        new_model, dm, stage_path, curve_terms, managed) if curve_terms else None
-    if curve_source is not None:
-        report["curve_adaln_source"] = {
-            "source": curve_source[0],
-            "residual": curve_source[1],
+    if affine is not None:
+        report["curve_adaln_projection"] = {
+            "source": affine.source,
+            "mode": "bypass",
+            "weight_targets": len(projected_curve),
+            "bias_targets": len(curve_bias_terms),
+            "dense_width": int(affine.mean.shape[0]),
+            "curve_width": int(affine.basis.shape[0]),
             "managed_adapter_bytes": managed_bytes,
             "owner_key": runtime_owner_key,
         }

@@ -1,15 +1,15 @@
 """State-owned transient/retained runtime resources for VDN-H3.
 
 The upstream v1.4 performance work showed that repeatedly allocating scan banks,
-window gather buffers and activation copies costs meaningful time.  Those buffers
-are useful, but process-global CUDA caches make ownership and cancellation ambiguous.
+window gather buffers and activation copies costs meaningful time. Those buffers are
+useful, but process-global CUDA caches make ownership and cancellation ambiguous.
 
-This module keeps the same optimization local to one Apply-VDN result.  The primary
-pool is leased for one diffusion-model execution at a time.  A nested or concurrent
-execution that cannot acquire that lease receives an isolated transient pool instead,
-so shared scratch is never raced across ModelPatcher clones or threads.
+This module keeps the optimization local to one Apply-VDN result. The primary pool is
+leased for one diffusion-model execution at a time. A nested or concurrent execution
+that cannot acquire that lease receives an isolated transient pool instead, so shared
+scratch is never raced across ModelPatcher clones or threads.
 
-Branch *weights* do not live here.  They remain either bounded streamed checkpoint
+Branch *weights* do not live here. They remain either bounded streamed checkpoint
 descriptors or a ComfyUI-managed additional ModelPatcher.
 """
 from __future__ import annotations
@@ -28,6 +28,12 @@ _MAX_DELTA_SCRATCH = 4
 _MAX_WINDOW_PLANS = 8
 _MAX_KV_SCRATCH = 4
 _MAX_ACTIVATION_SCRATCH = 2
+_ACTIVE_BUFFERS = contextvars.ContextVar("vdn_active_runtime_buffers", default=None)
+
+
+def current_runtime_buffers():
+    """Return the pool leased by the current diffusion-model execution, if any."""
+    return _ACTIVE_BUFFERS.get()
 
 
 def _bounded_put(mapping, key, value, limit):
@@ -180,8 +186,7 @@ class RuntimeBuffers:
                 "tk": torch.empty(tshape, device=device, dtype=dtype),
                 "tv": torch.empty(tshape, device=device, dtype=dtype),
             }
-            _bounded_put(
-                self._activations, key, hit, _MAX_ACTIVATION_SCRATCH)
+            _bounded_put(self._activations, key, hit, _MAX_ACTIVATION_SCRATCH)
         else:
             self._activations.move_to_end(key)
         return hit
@@ -215,10 +220,7 @@ class RuntimeBuffers:
             _bounded_put(self._kv, key, pair, _MAX_KV_SCRATCH)
         else:
             self._kv.move_to_end(key)
-        return (
-            pair[0][:need].view(shape),
-            pair[1][:need].view(shape),
-        )
+        return pair[0][:need].view(shape), pair[1][:need].view(shape)
 
     def prefetch_take(self, index):
         if not self.retain or not torch.cuda.is_available():
@@ -268,9 +270,11 @@ class RuntimeBufferOwner:
         primary = self.retain and self._lease.acquire(blocking=False)
         buffers = self._primary if primary else RuntimeBuffers(False)
         token = self._active.set(buffers)
+        global_token = _ACTIVE_BUFFERS.set(buffers)
         try:
             yield buffers
         finally:
+            _ACTIVE_BUFFERS.reset(global_token)
             self._active.reset(token)
             if primary:
                 self._lease.release()

@@ -3,7 +3,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vdn_h3.nodes import ApplyVDNH3, ApplyVDNH3Advanced, _validate_branch_shapes
+from vdn_h3.nodes import (
+    ApplyVDNH3,
+    ApplyVDNH3Advanced,
+    _effective_free_vram,
+    _validate_branch_shapes,
+)
 
 
 def _cfg(*, gate=True, short_conv=("k", "v")):
@@ -60,6 +65,38 @@ def test_linear_head_dim_incompatible_with_shared_qkv_fails_closed():
     cfg["linear_head_dim"] = 3
     with pytest.raises(RuntimeError, match="linear_head_dim=3"):
         _validate_branch_shapes("synthetic", [_weights()], cfg, 8, 2, 4)
+
+
+def test_effective_free_vram_reserves_unloaded_base_bytes(monkeypatch):
+    gib = 1 << 30
+
+    class Model:
+        @staticmethod
+        def model_size():
+            return 10 * gib
+
+        @staticmethod
+        def loaded_size():
+            return 3 * gib
+
+    monkeypatch.setattr("vdn_h3.nodes._free_vram", lambda: 12 * gib)
+    assert _effective_free_vram(Model()) == 5 * gib
+
+
+def test_effective_free_vram_never_goes_negative(monkeypatch):
+    gib = 1 << 30
+
+    class Model:
+        @staticmethod
+        def model_size():
+            return 12 * gib
+
+        @staticmethod
+        def loaded_size():
+            return 0
+
+    monkeypatch.setattr("vdn_h3.nodes._free_vram", lambda: 8 * gib)
+    assert _effective_free_vram(Model()) == 0
 
 
 def test_base_node_exposes_safe_runtime_and_v14_auto_controls(monkeypatch):

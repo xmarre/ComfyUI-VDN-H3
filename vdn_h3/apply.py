@@ -114,8 +114,6 @@ class _RuntimeLoRAWeight:
 
     def __init__(self, key: str, terms):
         self.key = key
-        # Adapter files are loaded as owned CPU tensors. Keep immutable references;
-        # each invocation transfers only the low-rank factors it needs.
         self.terms = tuple(
             (a.detach().contiguous(), b.detach().contiguous(), float(scale))
             for a, b, scale in terms
@@ -123,9 +121,9 @@ class _RuntimeLoRAWeight:
         self._vdn_runtime_lora = True
 
     def __call__(self, weight):
-        # Comfy's CastBiasWeightContext dequantizes a custom/QuantizedTensor weight
-        # before applying weight_function entries. Fail closed if a future core path
-        # violates that contract instead of attempting an implicit lossy conversion.
+        # Current Comfy dequantizes a QuantizedTensor before weight_function entries
+        # run. Refuse any future path that hands us opaque storage instead of quietly
+        # materializing a different representation ourselves.
         if not isinstance(weight, torch.Tensor) or not weight.is_floating_point():
             raise RuntimeError(
                 f"VDN runtime LoRA for {self.key} expected a floating compute weight; "
@@ -141,8 +139,8 @@ class _RuntimeLoRAWeight:
                 a, out.device, compute_dtype, copy=False)
             bv = comfy.model_management.cast_to_device(
                 b, out.device, compute_dtype, copy=False)
-            # Writes directly into the transient patched weight. This avoids the
-            # extra full-size delta allocation created by ``out + (B @ A)``.
+            # Write directly into the transient patched weight so ``B @ A`` is never
+            # materialized as another full-size tensor.
             out.addmm_(bv, av, beta=1.0, alpha=scale)
 
         if out.dtype != weight.dtype:
@@ -162,6 +160,15 @@ def _install_runtime_weight_adapters(new_model, terms_by_module) -> int:
         key = f"diffusion_model.{module}.weight"
         if key not in state_keys:
             raise RuntimeError(f"VDN runtime adapter target is absent from the base: {key}")
+
+        owner_key = f"diffusion_model.{module}"
+        owner = comfy.utils.get_attr(new_model.model, owner_key)
+        if not hasattr(owner, "weight_function"):
+            raise RuntimeError(
+                f"VDN runtime low-VRAM mode requires Comfy's weight_function contract, "
+                f"but {owner_key} ({type(owner).__name__}) does not expose it. Use "
+                "lora_mode='merge' for this unsupported module implementation.")
+
         weight = comfy.utils.get_attr(new_model.model, key)
         expected_shape = tuple(weight.shape)
         terms = terms_by_module[module]

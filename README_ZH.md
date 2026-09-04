@@ -128,9 +128,9 @@ python tools/extract_h3_time_embedder.py \
 
 ### `branch_weights=auto`
 
-吸收 upstream v1.4 的 VRAM-aware 意图，但保持更严格的 ownership：
+吸收 upstream v1.4 的 VRAM-aware 意图，但保持更严格的 ownership。这里使用的是**有效空闲显存**：Comfy 当前报告的 free VRAM 减去传入 base `MODEL` 尚未 resident 的字节数，避免尚未加载的 H3 base 被误当成 VDN 可用空间。
 
-- 普通 BF16 branch 满足 `1.5 x branch size + 4 GiB` headroom 时使用 `resident`；
+- 普通 BF16 branch 在该有效预算中满足 `1.5 x branch size + 4 GiB` headroom 时使用 `resident`；
 - 否则若存在 `model_int8_convrot_comfyui.safetensors`，选择该文件并使用 `stream`；
 - 否则 stream 普通 branch。
 
@@ -141,7 +141,8 @@ INT8 branch 在 auto 模式下仍然 **stream**。这里的 `resident` 必须是
 - 不常驻完整 branch；
 - 每个 block 需要时才从 stage 解析；
 - `safe_open` 生命周期限制在单次读取内，不保留 process-global mmap；
-- CUDA + retained buffers 时使用一-block lookahead；全局只有一个有界 worker executor，它不保存模型 tensor cache，每个 VDN state 最多只有一个可取消的 in-flight result。
+- CUDA + retained buffers 时使用一-block lookahead；全局只有一个有界 worker executor，它不保存模型 tensor cache，每个 VDN state 最多只有一个可取消的 in-flight result；
+- prefetch identity 包含 block index、完整 device 和 compute dtype，因此 placement/dtype 改变后不会复用旧 lookahead 结果。
 
 ### `branch_weights=resident`
 
@@ -174,7 +175,7 @@ Ownership：
 - cancel 会清理该 state 的 retained scratch/prefetch；
 - branch weight 和 LoRA factor 不存放在 scratch pool。
 
-`off` 使用 transient allocation。`auto` 沿用 upstream v1.4 的 `selected branch size + 10 GiB` headroom 规则。
+`off` 使用 transient allocation。`auto` 把 `selected branch size + 10 GiB` headroom 规则应用到同一个有效空闲显存预算，也就是先为尚未 resident 的 base `MODEL` 保留空间。
 
 CPU parity test 要求 retained/transient scan、window 和完整 linear-branch 路径与 reference 完全一致；真实 CUDA allocator/速度仍需 GPU 验证。
 
@@ -189,7 +190,7 @@ VDN 混合注意力本身通过 Comfy object patch 替换 `diffusion_model.block
 ## Attention backend
 
 - `grouped`：便携默认 exact-window 路径；会把 transformer options 继续传给 Comfy optimized-attention API；
-- `flex`：支持时使用 PyTorch FlexAttention；失败仅对本次调用回退 grouped；
+- `flex`：支持时使用 PyTorch FlexAttention；失败仅对本次调用回退 grouped；process-level BlockMask cache 为最多 8 项的 LRU，并按完整 device/layout identity 区分；
 - full coverage：走 Comfy 普通完整 attention，并关闭不存在的 linear complement。
 
 ## Upstream v1.4 对齐
@@ -209,7 +210,8 @@ VDN 混合注意力本身通过 Comfy object patch 替换 `diffusion_model.block
 - process-global safetensors handle -> 有界 open + file-identity invalidation；
 - private global GPU branch cache -> Comfy-managed resident model 或 stream；
 - global CUDA scan/KV scratch -> 每个 VDN execution 租用的 state-owned scratch；
-- 每 state 永久 worker -> 单一有界、无 tensor cache 的 executor + 每 state 最多一个 in-flight future。
+- 每 state 永久 worker -> 单一有界、无 tensor cache 的 executor + 每 state 最多一个 in-flight future；
+- 无界且只按 device type 区分的 Flex BlockMask cache -> 最多 8 项、按完整 device/layout identity 区分的 LRU。
 
 因此 upstream v1.4 benchmark 数字不能直接当成本分支性能数据，必须重新做真实 GPU 测试。
 
@@ -226,7 +228,7 @@ CI 两个 lane：
 2. **Current Comfy main smoke**
    - 当前 Comfy `master` 的包导入和节点注册。
 
-官方 oracle 覆盖 window/anchor、frame statistics、全部支持的 delta rule、双向 scan、alpha bridge、feature/short-conv、完整 `BidirectionalLinearBranch` 和 reduced `HybridAttention`。另有 retained/transient parity 测试。
+当前扩展 pinned suite 为 **97 个通过测试**。官方 oracle 覆盖 window/anchor、frame statistics、全部支持的 delta rule、双向 scan、alpha bridge、feature/short-conv、完整 `BidirectionalLinearBranch` 和 reduced `HybridAttention`。另有 retained/transient parity、base-residency-aware placement policy、prefetch placement identity 和 bounded Flex cache 回归。
 
 绿色 CI 不等于真实渲染质量、峰值 VRAM 或 wall-clock 性能验证。
 

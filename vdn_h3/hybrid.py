@@ -202,7 +202,11 @@ def make_vdn_forward(attn, state, block_index):
         v = v.clone()
 
         if window_active:
-            if state.softmax_backend == "flex":
+            # Fallback is intentionally execution-local. VDNState is shared by
+            # ModelPatcher clones, so mutating a configured backend after one transient
+            # failure would leak runtime state into later Continuum chunks/clones.
+            backend = state.softmax_backend
+            if backend == "flex":
                 from vdn_h3.window import window_softmax_flex
                 try:
                     softmax_out = window_softmax_flex(
@@ -210,11 +214,12 @@ def make_vdn_forward(attn, state, block_index):
                         layout.num_frames, layout.tokens_per_frame, layout.bounds,
                         head_dim ** -0.5, anchor_frames=cfg["anchor_frames"])
                 except Exception as exc:
-                    state.softmax_backend = "grouped"
+                    backend = "grouped"
                     _log.warning(
-                        "[vdn] flex attention failed (%s); falling back to grouped SDPA",
+                        "[vdn] flex attention failed (%s); falling back to grouped SDPA "
+                        "for this execution",
                         exc)
-            if state.softmax_backend != "flex":
+            if backend != "flex":
                 from vdn_h3.window import window_softmax_grouped
                 softmax_out = window_softmax_grouped(
                     q, k, v, layout.video_start, layout.video_end,

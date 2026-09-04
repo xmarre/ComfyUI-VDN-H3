@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from vdn_h3.nodes import _validate_branch_shapes
+from vdn_h3.nodes import ApplyVDNH3, ApplyVDNH3Advanced, _validate_branch_shapes
 
 
 def _cfg(*, gate=True, short_conv=("k", "v")):
@@ -60,3 +60,23 @@ def test_linear_head_dim_incompatible_with_shared_qkv_fails_closed():
     cfg["linear_head_dim"] = 3
     with pytest.raises(RuntimeError, match="linear_head_dim=3"):
         _validate_branch_shapes("synthetic", [_weights()], cfg, 8, 2, 4)
+
+
+def test_base_node_exposes_safe_runtime_and_v14_auto_controls(monkeypatch):
+    monkeypatch.setattr("vdn_h3.spec.list_vdn_checkpoints", lambda: ["stage"])
+    required = ApplyVDNH3.INPUT_TYPES()["required"]
+    assert required["lora_mode"][0] == ["merge", "bypass"]
+    assert required["lora_mode"][1]["default"] == "merge"
+    assert required["branch_weights"][0] == ["auto", "stream", "resident"]
+    assert required["branch_weights"][1]["default"] == "auto"
+    assert required["retain_buffers"][0] == ["auto", "on", "off"]
+    assert required["retain_buffers"][1]["default"] == "auto"
+
+
+def test_advanced_node_keeps_checkpoint_architecture_as_default(monkeypatch):
+    monkeypatch.setattr("vdn_h3.spec.list_vdn_checkpoints", lambda: ["stage"])
+    required = ApplyVDNH3Advanced.INPUT_TYPES()["required"]
+    assert required["architecture_mode"][0] == ["checkpoint", "override"]
+    assert required["architecture_mode"][1]["default"] == "checkpoint"
+    assert required["branch_weights"][1]["default"] == "auto"
+    assert required["retain_buffers"][1]["default"] == "auto"

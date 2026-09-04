@@ -63,12 +63,10 @@ The checkpoint/model-weight license is **not** Apache-2.0; see [Licensing and pr
 | `vdn_checkpoint` | Official stage directory under `models/vdn/` |
 | `apply_turbo_adapter` | Apply the stage's released Turbo/DMD adapter when present; enabled for the released 8-step DMD stage |
 | `strength` | Adapter strength; `1.0` is the released setting |
-| `lora_mode` | `merge` only: adapters are registered through ComfyUI's native `ModelPatcher` weight-patch lifecycle |
-| `branch_weights` | `stream` or `resident`, described below |
+| `lora_mode` | `merge` or `bypass`; see [LoRA adapter modes](#lora-adapter-modes) |
+| `branch_weights` | `stream` or `resident`; this controls the **VDN linear branch**, not LoRA application |
 | `attention_backend` | `grouped` portable windowed SDPA, or opt-in `flex` with grouped fallback |
 | `verbose` | Additional VDN layout/adapter logging |
-
-The former VDN `bypass` LoRA mode has been removed. VDN no longer installs or repairs mutable `module.forward` LoRA bypass chains. This is intentional: adapter correctness must not depend on injection/ejection order, clone order, another wrapper provider, or Continuum chunk lifecycle.
 
 ### Apply VDN-H3 Advanced
 
@@ -86,19 +84,43 @@ When override mode changes the checkpoint architecture, the node logs the differ
 
 `fast_kernels` optionally uses `torch.compile` for selected branch helpers. It preserves the same algorithm but can change BF16 rounding because fused kernels round at different operation boundaries. Compilation failure falls back to eager execution.
 
-## Adapter lifecycle and quantized bases
+## LoRA adapter modes
 
-Ordinary VDN LoRA targets are registered with ComfyUI's `ModelPatcher.add_patches` path. ComfyUI therefore owns weight backup/restore, clone behavior and load/offload transitions.
+`lora_mode` and `branch_weights` solve different memory problems and are intentionally independent.
 
-This matters for fused or quantized MiniMax-H3 modules: VDN does not dequantize and replace those modules itself. It delegates weight conversion/materialization to the same `convert_weight` / `set_weight` abstraction used by current ComfyUI. Synthetic CI coverage verifies this path and repeated restoration; real GPU validation is still required for each production quantization/layout combination.
+### `lora_mode=merge`
 
-The Q/K/V adapter conversion preserves independent LoRA ranks and `alpha/rank` scales by constructing an equivalent fused block-diagonal patch. Incomplete or malformed adapter targets fail during checkpoint/application validation instead of being silently skipped.
+- registers the Stage-B/Turbo adapters through normal `ModelPatcher.add_patches()`;
+- Comfy owns backup/restore, load/offload, custom-weight conversion and requantization;
+- this remains the reference/eager adapter path and the conservative choice for output validation;
+- on quantized bases, eager dequantize -> patch -> requantize can have a substantial temporary VRAM cost.
+
+### `lora_mode=bypass` — safe runtime low-VRAM mode
+
+The `bypass` name is preserved for existing workflows, but this is **not the old `BypassForwardHook` implementation**.
+
+The current runtime mode:
+
+- registers adapter work with Comfy's public `ModelPatcher.add_weight_wrapper()` / `weight_function` lifecycle;
+- never replaces, traverses, splices or restores `module.forward`;
+- never installs a VDN `PatcherInjection` or `_vdn_live_hooks` chain;
+- keeps the resident base parameter unmerged;
+- keeps LoRA A/B factors as low-rank tensors rather than a second resident full-size patched weight;
+- builds only the current layer's transient compute weight and accumulates each `B @ A` contribution into it with in-place `addmm_`, avoiding a second full-size delta tensor;
+- aggregates Stage-B and Turbo terms targeting the same weight into one runtime wrapper;
+- is copied/installed/removed by the normal `ModelPatcher` clone and model-load lifecycle.
+
+This restores the low-VRAM adapter option without reintroducing the cross-provider forward-chain recursion that could crash Continuum before chunk 2 reached its first transformer evaluation.
+
+For quantized/fused MiniMax-H3 modules, Comfy's cast path remains authoritative. A runtime weight wrapper can cause a patched INT8 layer to use a dequantized compute fallback for that invocation instead of the fused INT8 kernel. That trades speed for avoiding eager patched-weight materialization; measure it on the actual base and workflow rather than assuming either mode is universally cheaper.
+
+**Output note:** historical VDN bypass measurements used a different forward-hook implementation and showed quality differences on the 8-step DMD stage. They do not establish the numerical behavior of this new weight-wrapper runtime mode. Until matched GPU renders are complete, use `merge` as the reference path for Stage-DMD quality comparisons and treat `bypass` as the low-VRAM path that still requires real-render validation.
 
 ## Curve/pruned MiniMax-H3 bases
 
 Some MiniMax-H3 checkpoints collapse the dense time embedding into `adaln_t_table`. A full-width learned AdaLN LoRA cannot in general be projected into that smaller curve basis exactly.
 
-This node therefore does **not** drop those adapter weights and does not approximate them. For a curve/pruned base it reconstructs the matching dense time-embedder input and applies the original low-rank AdaLN delta at runtime while leaving the base curve projection intact.
+This node therefore does **not** drop those adapter weights and does not approximate them. For a curve/pruned base it reconstructs the matching dense time-embedder input and applies the original low-rank AdaLN delta at runtime while leaving the base curve projection intact. This exact AdaLN path is used regardless of whether ordinary adapter targets use `merge` or `bypass`.
 
 To do that exactly, VDN needs the dense time embedder corresponding to the curve base. It resolves either:
 
@@ -115,11 +137,13 @@ python tools/extract_h3_time_embedder.py \
 
 If no compatible dense embedder can be established, application fails closed with an actionable error. It never silently omits learned AdaLN adapter parameters.
 
-## Branch-weight residency
+## VDN branch-weight residency
+
+This is separate from `lora_mode`.
 
 `branch_weights=stream`
 
-- does not keep the complete VDN branch resident as an additional model;
+- does not keep the complete VDN linear branch resident as an additional model;
 - resolves each block from the stage file when needed;
 - keeps safetensors mappings bounded to each load operation rather than retaining process-global mmap handles.
 
@@ -131,13 +155,25 @@ If no compatible dense embedder can be established, application fails closed wit
 
 Quantized VDN branch files currently require `stream`; resident mode fails closed rather than silently dequantizing them.
 
+A low-memory setup can therefore combine `lora_mode=bypass` with `branch_weights=stream`: the first controls adapter materialization, while the second controls VDN linear-branch residency.
+
 ## Composition and lifecycle
 
-VDN replaces `diffusion_model.blocks.*.attn.forward` through a Comfy object patch. Another extension that owns that exact object-patch target is incompatible; VDN refuses an existing conflicting owner rather than stacking ambiguous forward replacements.
+VDN replaces `diffusion_model.blocks.*.attn.forward` for the **VDN hybrid-attention transform** through a Comfy object patch. Another extension that owns that exact attention object-patch target is incompatible; VDN refuses an existing conflicting owner rather than stacking ambiguous attention replacements.
 
-Ordinary model weight patches/LoRAs use a different Comfy lifecycle and are not traversed or reordered by VDN.
+That attention ownership is distinct from LoRA runtime mode. `lora_mode=bypass` does **not** patch any LoRA target's `module.forward`; it uses weight wrappers instead. Ordinary model weight patches/LoRAs remain under Comfy's weight lifecycle and are not traversed or reordered by VDN.
 
-The test suite includes repeated `ModelPatcher` clone/load/unload cycles and a pseudo-Continuum sequence that executes the conditioning path (`preprocess_text_embeds -> token_refiner.fc1`) before a transformer evaluation on every chunk. It verifies stable outputs, restored base weights, unchanged forwards and no 2x/3x adapter accumulation. That is structural CPU coverage; it is not a substitute for a real GPU Continuum render.
+The test suite includes repeated `ModelPatcher` clone/load/unload cycles and a pseudo-Continuum sequence that executes the conditioning path (`preprocess_text_embeds -> token_refiner.fc1`) before a transformer evaluation on every chunk. Runtime-mode regressions additionally require:
+
+- no VDN LoRA injections;
+- unchanged `module.forward` ownership;
+- unchanged resident base weights;
+- one aggregate runtime wrapper per target weight;
+- stable output across repeated clones;
+- no 2x/3x adapter accumulation;
+- independent strength changes from the true base.
+
+That is structural CPU coverage; it is not a substitute for a real GPU Continuum render or VRAM measurement.
 
 ## Attention backends
 
@@ -145,7 +181,7 @@ The test suite includes repeated `ModelPatcher` clone/load/unload cycles and a p
 - `flex` uses PyTorch FlexAttention when available and suitable. Failure falls back to grouped execution for that call without mutating shared VDN state.
 - full-coverage windows use ComfyUI's normal optimized dense-attention path and disable the linear complement because nothing lies outside the softmax window.
 
-See [Benchmarks.md](Benchmarks.md) for historical measurements. Those measurements predate this lifecycle refactor unless explicitly marked otherwise and must not be treated as performance validation of the current branch.
+See [Benchmarks.md](Benchmarks.md) for historical measurements. Those measurements predate this lifecycle/runtime-adapter refactor unless explicitly marked otherwise and must not be treated as performance validation of the current branch.
 
 ## Validation
 
@@ -155,17 +191,18 @@ The repository CI has two distinct lanes:
    - ComfyUI `6c53f8c9a06d95f3d847009ceaae55c624169247`;
    - OpenVDN `b8cb28fbfca0266d1c7742a9f25ab8b58191de97`;
    - direct reduced-dimension CPU comparisons against imported OpenVDN source;
-   - independent math, adapter conversion, ModelSpec/checkpoint, curve, quantized-patch and lifecycle regressions.
+   - independent math, adapter conversion, ModelSpec/checkpoint, curve, quantized/custom-weight and lifecycle regressions.
 2. **Current Comfy main smoke**
    - checks current Comfy `master` for package import and node registration against the latest API surface.
 
-The direct oracle covers window bounds/anchors, frame statistics, all supported delta rules, forward/reverse scans, alpha bridge, feature preparation/short-conv behavior and the complete `BidirectionalLinearBranch` under reduced CPU dimensions. The pinned suite currently contains 70 passing tests.
+The direct oracle covers window bounds/anchors, frame statistics, all supported delta rules, forward/reverse scans, alpha bridge, feature preparation/short-conv behavior and the complete `BidirectionalLinearBranch` under reduced CPU dimensions.
 
-No large checkpoint or GPU render is run in CI. A green synthetic/oracle suite establishes implementation and lifecycle contracts; it does not establish real-render quality, GPU memory use or wall-clock performance.
+No large checkpoint or GPU render is run in CI. A green synthetic/oracle suite establishes implementation and lifecycle contracts; it does not establish real-render quality, peak VRAM or wall-clock performance.
 
 ## Compatibility requirements
 
 - current ComfyUI MiniMax-H3 implementation with `diffusion_model.blocks[].attn.qkv_proj`;
+- runtime `bypass` additionally requires the target Comfy module to expose the supported `weight_function` contract; unsupported module implementations fail closed and can use `merge`;
 - the official VDN v2 ModelSpec/hybrid-transform contract;
 - stage/base block count and every enabled trained branch tensor shape must match;
 - malformed, incomplete, unsupported or stale-replaced checkpoint resources fail early.

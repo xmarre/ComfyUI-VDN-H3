@@ -90,6 +90,31 @@ def test_swiglu_b_half_swap_matches_comfy_gate_value_order():
     assert scale == 1.0
 
 
+def test_turbo_block_adaln_maps_without_projection_or_shape_change():
+    torch.manual_seed(44)
+    a = torch.randn(4, 12)
+    b = torch.randn(18, 4)
+    module = "transformer_blocks.7.adaln_proj.linear"
+    converted = convert_adapter(_pair(module, a, b), {"rank": 4, "alpha": 2})
+    got_a, got_b, scale = converted["blocks.7.adaln_proj.linear"]
+    assert torch.equal(got_a, a.float())
+    assert torch.equal(got_b, b.float())
+    assert scale == 0.5
+
+
+def test_turbo_final_adaln_maps_to_comfy_final_layer_exactly():
+    torch.manual_seed(45)
+    a = torch.randn(3, 10)
+    b = torch.randn(15, 3)
+    converted = convert_adapter(
+        _pair("norm_out.linear", a, b), {"rank": 3, "alpha": 3})
+    assert set(converted) == {"final_layer.adaln_proj.linear"}
+    got_a, got_b, scale = converted["final_layer.adaln_proj.linear"]
+    assert torch.equal(got_a, a.float())
+    assert torch.equal(got_b, b.float())
+    assert scale == 1.0
+
+
 def test_missing_lora_side_fails_with_context():
     state = {
         "transformer_blocks.0.attn.orig.to_out.0.lora_A.weight": torch.randn(2, 4),

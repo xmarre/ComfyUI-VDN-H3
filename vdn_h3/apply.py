@@ -1,11 +1,13 @@
 """Apply released VDN adapters through ComfyUI-owned patch mechanisms.
 
-VDN intentionally does *not* participate in ``BypassForwardHook`` chains. Ordinary
-LoRA targets, including quantized/fused weights, are registered with
-``ModelPatcher.add_patches`` so Comfy owns backup/restore, low-VRAM application and
-clone semantics. Full-width AdaLN LoRAs on a curve/pruned H3 base are reconstructed
-at runtime by :mod:`vdn_h3.curve` and installed as ordinary ModelPatcher object
-patches; they are not mutable injection hooks.
+VDN intentionally does *not* participate in ``BypassForwardHook`` chains. ``merge``
+uses normal ``ModelPatcher.add_patches`` weight ownership. ``bypass`` is retained as
+the low-VRAM runtime mode for workflow compatibility, but its implementation is now
+ComfyUI ``weight_function``/``add_weight_wrapper`` based: VDN never traverses,
+replaces, splices, or restores ``module.forward``.
+
+Full-width AdaLN LoRAs on a curve/pruned H3 base are reconstructed at runtime by
+:mod:`vdn_h3.curve` and installed as ordinary ModelPatcher object patches.
 """
 from __future__ import annotations
 
@@ -13,6 +15,7 @@ import logging
 
 import torch
 
+import comfy.float
 import comfy.lora
 import comfy.model_management
 import comfy.patcher_extension
@@ -57,8 +60,8 @@ def _native_patch_adapter(new_model, converted, strength: float) -> int:
     """Register one adapter entirely through ``ModelPatcher.add_patches``.
 
     This is the same path Comfy uses for normal LoRAs and is intentionally used for
-    fused/quantized FC2 as well: the patcher knows how a quantized parameter must be
-    converted/materialized, whereas a module-forward hook does not.
+    fused/quantized weights as well: the patcher owns conversion, backup, restore,
+    low-VRAM fallback and requantization semantics.
     """
     if not converted:
         return 0
@@ -90,6 +93,94 @@ def _native_patch_adapter(new_model, converted, strength: float) -> int:
             + ", ".join(missing_patch[:8])
             + (" ..." if len(missing_patch) > 8 else ""))
     return len(accepted)
+
+
+class _RuntimeLoRAWeight:
+    """Stateless low-VRAM LoRA weight wrapper owned by ``ModelPatcher``.
+
+    The old bypass path evaluated ``up(down(x))`` by replacing ``module.forward``.
+    That kept adapter weights small but made correctness depend on a mutable forward
+    chain shared by ModelPatcher clones. This wrapper keeps the same *residency*
+    property without such a chain: Comfy installs it in the module's supported
+    ``weight_function`` list only while the corresponding patcher is loaded.
+
+    One transient compute-dtype copy of the current layer weight is made per call;
+    low-rank terms are accumulated into it with ``addmm_`` so a second full-sized
+    ``B @ A`` tensor is never materialized. No prepared/device cache is stored on
+    this object, making shallow ModelPatcher clones reentrant and device-agnostic.
+    """
+
+    __slots__ = ("key", "terms", "_vdn_runtime_lora")
+
+    def __init__(self, key: str, terms):
+        self.key = key
+        # Adapter files are loaded as owned CPU tensors. Keep immutable references;
+        # each invocation transfers only the low-rank factors it needs.
+        self.terms = tuple(
+            (a.detach().contiguous(), b.detach().contiguous(), float(scale))
+            for a, b, scale in terms
+        )
+        self._vdn_runtime_lora = True
+
+    def __call__(self, weight):
+        # Comfy's CastBiasWeightContext dequantizes a custom/QuantizedTensor weight
+        # before applying weight_function entries. Fail closed if a future core path
+        # violates that contract instead of attempting an implicit lossy conversion.
+        if not isinstance(weight, torch.Tensor) or not weight.is_floating_point():
+            raise RuntimeError(
+                f"VDN runtime LoRA for {self.key} expected a floating compute weight; "
+                f"got {type(weight).__name__} / {getattr(weight, 'dtype', None)}")
+
+        compute_dtype = comfy.model_management.lora_compute_dtype(weight.device)
+        if compute_dtype is None:
+            compute_dtype = weight.dtype
+        out = weight.to(dtype=compute_dtype, copy=True)
+
+        for a, b, scale in self.terms:
+            av = comfy.model_management.cast_to_device(
+                a, out.device, compute_dtype, copy=False)
+            bv = comfy.model_management.cast_to_device(
+                b, out.device, compute_dtype, copy=False)
+            # Writes directly into the transient patched weight. This avoids the
+            # extra full-size delta allocation created by ``out + (B @ A)``.
+            out.addmm_(bv, av, beta=1.0, alpha=scale)
+
+        if out.dtype != weight.dtype:
+            out = comfy.float.stochastic_rounding(
+                out, weight.dtype, seed=comfy.utils.string_to_seed(self.key))
+        return out
+
+
+def _install_runtime_weight_adapters(new_model, terms_by_module) -> int:
+    """Register one aggregate stateless runtime wrapper for each model weight."""
+    if not terms_by_module:
+        return 0
+
+    state_keys = set(new_model.model.state_dict().keys())
+    installed = 0
+    for module in sorted(terms_by_module):
+        key = f"diffusion_model.{module}.weight"
+        if key not in state_keys:
+            raise RuntimeError(f"VDN runtime adapter target is absent from the base: {key}")
+        weight = comfy.utils.get_attr(new_model.model, key)
+        expected_shape = tuple(weight.shape)
+        terms = terms_by_module[module]
+        for a, b, _scale in terms:
+            if a.ndim != 2 or b.ndim != 2 or a.shape[0] != b.shape[1]:
+                raise RuntimeError(
+                    f"VDN runtime LoRA {key} has incompatible A{tuple(a.shape)} "
+                    f"B{tuple(b.shape)}")
+            delta_shape = (b.shape[0], a.shape[1])
+            if delta_shape != expected_shape:
+                raise RuntimeError(
+                    f"VDN runtime LoRA {key} produces {delta_shape}, but the base "
+                    f"weight is {expected_shape}")
+
+        # Public ModelPatcher lifecycle: clones copy wrapper registrations and core
+        # installs/removes them in module.weight_function during load/offload.
+        new_model.add_weight_wrapper(key, _RuntimeLoRAWeight(key, terms))
+        installed += 1
+    return installed
 
 
 def _install_curve_adaln(new_model, dm, stage_path, terms_by_module):
@@ -146,43 +237,57 @@ def apply_adapters(new_model, converted_by_name, strength, mode="merge",
                    stage_path=None, verbose=False):
     """Apply converted released adapters to a cloned MiniMax-H3 ModelPatcher.
 
-    ``mode`` remains in the Python signature only so old serialized workflows fail
-    with an explicit migration message. The node UI exposes only ``merge``.
+    ``merge`` uses normal Comfy weight patches. ``bypass`` is the compatibility name
+    for VDN's low-VRAM runtime mode; unlike the removed implementation it uses
+    ``ModelPatcher.add_weight_wrapper`` and never replaces ``module.forward``.
     ``strength`` may be one float or ``{adapter_name: float}``.
     """
-    if mode != "merge":
-        raise RuntimeError(
-            "VDN lora_mode='bypass' was removed because mutable module.forward "
-            "BypassForwardHook chains are not lifecycle-safe across ModelPatcher "
-            "clones/Continuum chunks. Use lora_mode='merge'; adapters now use "
-            "ComfyUI's native patch ownership.")
+    if mode not in ("merge", "bypass"):
+        raise ValueError(f"VDN lora_mode must be 'merge' or 'bypass', got {mode!r}")
 
     per_name = strength if isinstance(strength, dict) else None
     dm = new_model.get_model_object("diffusion_model")
     pruned = _is_pruned_base(dm)
     report = {}
     curve_terms = {}
+    runtime_terms = {}
 
     for name, converted in converted_by_name.items():
         s = float(per_name.get(name, 1.0) if per_name is not None else strength)
         ordinary = {}
+        runtime_count = 0
         curve_count = 0
         for path, (a, b, scale) in converted.items():
+            effective_scale = float(scale) * s
             if pruned and _is_adaln(path):
-                curve_terms.setdefault(path, []).append((a, b, float(scale) * s))
+                curve_terms.setdefault(path, []).append((a, b, effective_scale))
                 curve_count += 1
+            elif mode == "bypass":
+                runtime_terms.setdefault(path, []).append((a, b, effective_scale))
+                runtime_count += 1
             else:
                 ordinary[path] = (a, b, scale)
 
-        patched = _native_patch_adapter(new_model, ordinary, s)
+        patched = _native_patch_adapter(new_model, ordinary, s) if ordinary else 0
         report[name] = {
             "native_weight_patches": patched,
+            "runtime_weight_targets": runtime_count,
             "curve_adaln": curve_count,
             "strength": s,
         }
         if verbose:
-            _log.info("[vdn] adapter %s: %d native weight patches, %d curve AdaLN",
-                      name, patched, curve_count)
+            _log.info(
+                "[vdn] adapter %s: %d native patches, %d runtime-lowvram targets, "
+                "%d curve AdaLN",
+                name, patched, runtime_count, curve_count)
+
+    runtime_wrappers = _install_runtime_weight_adapters(
+        new_model, runtime_terms) if runtime_terms else 0
+    if runtime_wrappers:
+        report["runtime_lowvram"] = {
+            "weight_wrappers": runtime_wrappers,
+            "forward_hooks": 0,
+        }
 
     curve_source = _install_curve_adaln(
         new_model, dm, stage_path, curve_terms) if curve_terms else None

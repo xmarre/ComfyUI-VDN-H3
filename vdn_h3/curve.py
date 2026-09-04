@@ -72,7 +72,7 @@ def _file_identity(path: str) -> tuple[str, int, int, int | None]:
 
 
 def _tensor_hash(t: torch.Tensor) -> str:
-    x = t.detach().to(torch.float32, device="cpu").contiguous()
+    x = t.detach().to(device="cpu", dtype=torch.float32).contiguous()
     h = hashlib.sha256()
     h.update(str(tuple(x.shape)).encode())
     h.update(x.numpy().tobytes())
@@ -126,7 +126,7 @@ class DenseTimeEmbedder:
 
     def silu_grid(self, t: torch.Tensor) -> torch.Tensor:
         """Return ``silu(TimeEmbedder(t))`` with current Comfy H3 arithmetic."""
-        t = t.detach().to(torch.float32, device="cpu").reshape(-1)
+        t = t.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
         half = self.freq_dim // 2
         freqs = torch.exp(
             -math.log(10000.0) * torch.arange(half, dtype=torch.float32) / half)
@@ -154,8 +154,8 @@ def _load_embedder(path: str, prefix: str = "") -> DenseTimeEmbedder:
 
 def _curve_fit_residual(table: torch.Tensor, dense_grid: torch.Tensor) -> float:
     """Compatibility fingerprint only; does not transform any adapter tensor."""
-    table = table.detach().to(torch.float32, device="cpu")
-    grid = dense_grid.detach().to(torch.float32, device="cpu")
+    table = table.detach().to(device="cpu", dtype=torch.float32)
+    grid = dense_grid.detach().to(device="cpu", dtype=torch.float32)
     if table.shape[0] != grid.shape[0]:
         return float("inf")
     x = torch.cat([torch.ones(table.shape[0], 1), table], dim=1)
@@ -202,7 +202,7 @@ def find_dense_time_embedder(stage_path: str, table: torch.Tensor) -> tuple[Dens
     and the best compatible source is used. If no source meets the strict guard,
     fail closed rather than dropping or approximating the learned AdaLN delta.
     """
-    table_cpu = table.detach().to(torch.float32, device="cpu").clone()
+    table_cpu = table.detach().to(device="cpu", dtype=torch.float32).clone()
     if table_cpu.ndim != 2 or table_cpu.shape[0] < 2:
         raise RuntimeError(
             f"MiniMax-H3 adaln_t_table has invalid shape {tuple(table_cpu.shape)}")

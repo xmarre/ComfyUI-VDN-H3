@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 from vdn_h3 import branch as B
 from vdn_h3 import window as W
+from vdn_h3.hybrid import VDNState
 from vdn_h3.retained import (
     RuntimeLinearBranch,
     run_scans_runtime,
@@ -166,3 +169,36 @@ def test_complete_runtime_linear_branch_matches_reference_branch():
         assert resources.retained_counts()["scan"] >= 1
 
     assert torch.equal(got, want)
+
+
+def test_stream_prefetch_identity_includes_block_device_and_dtype():
+    class Resources:
+        retain = True
+
+        def __init__(self):
+            self.taken = []
+            self.requested = []
+
+        def prefetch_take(self, key):
+            self.taken.append(key)
+            return None
+
+        def prefetch_request(self, key, fetch):
+            self.requested.append(key)
+
+    resources = Resources()
+
+    class Runtime:
+        @staticmethod
+        def current():
+            return resources
+
+    state = VDNState(
+        "test", {}, [SimpleNamespace(w={}), SimpleNamespace(w={})], 1, 1)
+    state.runtime = Runtime()
+    state._stream_weights = lambda index, device, dtype: {"block": index}
+
+    got = state.weights_on(0, "cuda:0", torch.bfloat16)
+    assert got == {"block": 0}
+    assert resources.taken == [(0, "cuda:0", torch.bfloat16)]
+    assert resources.requested == [(1, "cuda:0", torch.bfloat16)]

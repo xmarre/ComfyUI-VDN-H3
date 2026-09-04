@@ -139,3 +139,31 @@ def test_production_width_and_51_curve_modules_project_to_rank8():
     assert len(offsets) == 51
     assert all(group[0][0].shape == (rank, curve) for group in projected.values())
     assert all(group[0][0].shape == (out,) for group in offsets.values())
+
+
+def test_kj_selected_int8_path_prefers_matching_bf16_sibling(tmp_path, monkeypatch):
+    table = torch.randn(9, 3)
+    selected = tmp_path / "model-comfy-int8-convrot.safetensors"
+    bf16 = tmp_path / "model-comfy.safetensors"
+    # The selected quantized derivative intentionally carries no affine auxiliaries.
+    save_file({"dummy": torch.zeros(1)}, selected)
+    _save_affine(bf16, torch.randn(3, 11), torch.randn(11), table)
+
+    class Patcher:
+        cached_patcher_init = (object(), (str(selected), {"weight_dtype": "int8"}, None))
+
+    monkeypatch.setattr(affine, "_candidate_affine_checkpoints", affine._candidate_affine_checkpoints)
+    # Keep the test scoped to the selected model directory instead of the runner's
+    # global Comfy model registry.
+    import sys
+    monkeypatch.setitem(sys.modules, "folder_paths", None)
+    affine._AFFINE_CACHE.clear()
+
+    candidates = list(affine._candidate_affine_checkpoints(Patcher()))
+    assert os.path.realpath(str(selected)) == os.path.realpath(candidates[0])
+    assert os.path.realpath(str(bf16)) in {os.path.realpath(path) for path in candidates}
+
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    got = affine.find_curve_affine(str(stage), table, base_patcher=Patcher())
+    assert os.path.realpath(got.source) == os.path.realpath(bf16)

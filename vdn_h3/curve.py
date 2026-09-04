@@ -1,18 +1,18 @@
 """Exact dense-AdaLN adapter support for ComfyUI MiniMax-H3 curve bases.
 
 Curve/pruned H3 checkpoints replace the dense time embedder with ``adaln_t_table``
-and make every AdaLN projection consume the table coordinates directly.  A dense
+and make every AdaLN projection consume the table coordinates directly. A dense
 Turbo LoRA therefore cannot be reshaped or projected into the small curve basis
 without approximation.
 
 This module takes the exact route instead: recover the matching *dense* H3 time
 embedder from either a checkpoint-local companion file or an installed non-curve H3
 checkpoint, evaluate it at the exact timesteps used by current ComfyUI, and add the
-original low-rank AdaLN delta at runtime.  The base curve projection itself remains
+original low-rank AdaLN delta at runtime. The base curve projection itself remains
 untouched.
 
 The least-squares curve residual used below is only a compatibility fingerprint for
-choosing the matching dense time embedder.  It is never used to project adapter
+choosing the matching dense time embedder. It is never used to project adapter
 weights and therefore never changes the adapter mathematics.
 """
 from __future__ import annotations
@@ -23,6 +23,7 @@ import logging
 import math
 import os
 import struct
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -41,10 +42,27 @@ TIME_KEYS = (
 )
 DEFAULT_FREQ_DIM = 256
 # A matching H3 dense/curve pair is a low-rank *base-model* approximation, so its
-# residual is non-zero.  Keep this deliberately strict: wrong-build grids observed in
-# the wild are an order of magnitude worse.  The chosen value is a compatibility
+# residual is non-zero. Keep this deliberately strict: wrong-build grids observed in
+# the wild are an order of magnitude worse. The chosen value is a compatibility
 # guard, not an error tolerance for VDN math.
 MAX_CURVE_MATCH_RESIDUAL = 5.0e-4
+
+
+class CurveAdalnState:
+    """Per-execution dense AdaLN state with correct nested/reentrant restoration."""
+
+    def __init__(self):
+        self._value: ContextVar[torch.Tensor | None] = ContextVar(
+            "vdn_curve_dense_silu_temb", default=None)
+
+    def push(self, value: torch.Tensor) -> Token:
+        return self._value.set(value)
+
+    def reset(self, token: Token) -> None:
+        self._value.reset(token)
+
+    def get(self) -> torch.Tensor | None:
+        return self._value.get()
 
 
 def _file_identity(path: str) -> tuple[str, int, int, int | None]:
@@ -69,7 +87,13 @@ def _safetensors_header(path: str) -> dict:
         size = struct.unpack("<Q", raw)[0]
         if size <= 0 or size > (64 << 20):
             raise ValueError(f"{path}: invalid safetensors header size {size}")
-        return json.loads(fh.read(size))
+        payload = fh.read(size)
+        if len(payload) != size:
+            raise ValueError(f"{path}: truncated safetensors JSON header")
+        header = json.loads(payload)
+        if not isinstance(header, dict):
+            raise ValueError(f"{path}: safetensors header is not an object")
+        return header
 
 
 def _find_dense_prefix(header: dict) -> str | None:
@@ -85,7 +109,7 @@ def _find_dense_prefix(header: dict) -> str | None:
 
 
 def _owned_tensor(handle, key: str) -> torch.Tensor:
-    # safe_open tensors may reference the file mapping.  Always detach ownership
+    # safe_open tensors may reference the file mapping. Always detach ownership
     # before leaving the context, including when the source tensor is already fp32.
     return handle.get_tensor(key).to(torch.float32).clone()
 
@@ -116,7 +140,9 @@ def _load_embedder(path: str, prefix: str = "") -> DenseTimeEmbedder:
     identity = _file_identity(path)
     header = _safetensors_header(path)
     if not prefix:
-        prefix = _find_dense_prefix(header) or ""
+        detected = _find_dense_prefix(header)
+        if detected is not None:
+            prefix = detected
     keys = [prefix + k for k in TIME_KEYS]
     missing = [k for k in keys if k not in header]
     if missing:
@@ -154,7 +180,7 @@ def _candidate_dense_checkpoints() -> Iterable[str]:
     return out
 
 
-# Small bounded process cache.  Keys include both the curve table hash and concrete
+# Small bounded process cache. Keys include both the curve table hash and concrete
 # file identity, so replacing a candidate checkpoint cannot reuse stale weights.
 _EMBEDDER_CACHE: dict[tuple[str, tuple], tuple[DenseTimeEmbedder, float]] = {}
 _MAX_EMBEDDER_CACHE = 4
@@ -171,19 +197,27 @@ def _cache_put(key, value):
 def find_dense_time_embedder(stage_path: str, table: torch.Tensor) -> tuple[DenseTimeEmbedder, float]:
     """Resolve the exact dense time embedder corresponding to a curve H3 base.
 
-    A checkpoint-local ``dense_time_embedder.safetensors`` is authoritative.  If it
+    A checkpoint-local ``dense_time_embedder.safetensors`` is authoritative. If it
     is absent, installed non-curve H3 checkpoints are scored against the curve table
-    and the best compatible source is used.  If no source meets the strict guard,
+    and the best compatible source is used. If no source meets the strict guard,
     fail closed rather than dropping or approximating the learned AdaLN delta.
     """
     table_cpu = table.detach().to(torch.float32, device="cpu").clone()
+    if table_cpu.ndim != 2 or table_cpu.shape[0] < 2:
+        raise RuntimeError(
+            f"MiniMax-H3 adaln_t_table has invalid shape {tuple(table_cpu.shape)}")
     table_key = _tensor_hash(table_cpu)
     rows = table_cpu.shape[0]
     t_grid = torch.arange(rows, dtype=torch.float32) / float(rows - 1)
 
     local = os.path.join(stage_path, TIME_EMBEDDER_FILENAME)
     candidates = [local] if os.path.isfile(local) else []
-    candidates.extend(p for p in _candidate_dense_checkpoints() if p not in candidates)
+    seen = {os.path.realpath(local)} if candidates else set()
+    for path in _candidate_dense_checkpoints():
+        real = os.path.realpath(path)
+        if real not in seen:
+            candidates.append(path)
+            seen.add(real)
 
     best = None
     errors = []
@@ -196,9 +230,14 @@ def find_dense_time_embedder(stage_path: str, table: torch.Tensor) -> tuple[Dens
                 embedder, residual = cached
             else:
                 header = _safetensors_header(path)
-                prefix = "" if path == local else (_find_dense_prefix(header) or "")
-                if path != local and not prefix:
-                    continue
+                if os.path.realpath(path) == os.path.realpath(local):
+                    prefix = ""
+                else:
+                    prefix = _find_dense_prefix(header)
+                    # Empty string is a valid root prefix. Only None means no dense
+                    # time embedder was found (or a curve checkpoint was detected).
+                    if prefix is None:
+                        continue
                 embedder = _load_embedder(path, prefix)
                 dense_grid = embedder.silu_grid(t_grid)
                 residual = _curve_fit_residual(table_cpu, dense_grid)
@@ -245,7 +284,7 @@ def minimax_unique_timesteps(dm, x, timestep, context, transformer_options=None,
                              audio_denoise_mask=None) -> list[float]:
     """Mirror current ComfyUI MiniMaxH3Model._forward's ``unique_t`` construction.
 
-    This includes reference/condition rows and per-row masked timesteps.  Keeping this
+    This includes reference/condition rows and per-row masked timesteps. Keeping this
     as a separately tested function is deliberate: a Comfy upstream layout change
     must fail the compatibility CI rather than quietly misalign AdaLN rows.
     """
@@ -313,8 +352,8 @@ def minimax_unique_timesteps(dm, x, timestep, context, transformer_options=None,
     return sorted(values)
 
 
-def make_dense_curve_wrapper(dm, embedder: DenseTimeEmbedder, shared: dict):
-    """DIFFUSION_MODEL wrapper publishing exact dense AdaLN inputs for one forward."""
+def make_dense_curve_wrapper(dm, embedder: DenseTimeEmbedder, state: CurveAdalnState):
+    """Publish exact dense AdaLN inputs for the duration of one model execution."""
     def wrap(executor, *args, **kwargs):
         x = args[0] if args else kwargs["x"]
         timestep = args[1] if len(args) > 1 else kwargs["timestep"]
@@ -326,23 +365,23 @@ def make_dense_curve_wrapper(dm, embedder: DenseTimeEmbedder, shared: dict):
             kwargs.get("minimax_payload"), kwargs.get("denoise_mask"),
             kwargs.get("audio_denoise_mask"))
         dense = embedder.silu_grid(torch.tensor(unique_t, dtype=torch.float32))
-        shared["dense_silu_temb"] = dense.to(context.device, context.dtype)
+        token = state.push(dense.to(context.device, context.dtype))
         try:
             return executor(*args, **kwargs)
         finally:
-            shared["dense_silu_temb"] = None
+            state.reset(token)
     return wrap
 
 
 def make_curve_adaln_forward(base, terms: list[tuple[torch.Tensor, torch.Tensor, float]],
-                             shared: dict):
+                             state: CurveAdalnState):
     """Patch one curve ``AdalnProj.forward`` without a mutable forward-hook chain."""
     if getattr(base, "apply_silu", True):
         raise RuntimeError("curve AdaLN patch received a full-width AdalnProj")
 
     def forward(t_emb):
         x = base.linear(t_emb)
-        dense = shared.get("dense_silu_temb")
+        dense = state.get()
         if dense is None:
             raise RuntimeError("VDN curve AdaLN state is unavailable outside model forward")
         if dense.shape[0] != x.shape[0]:

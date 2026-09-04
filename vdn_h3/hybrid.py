@@ -93,14 +93,17 @@ class VDNState:
                 or torch.device(device).type != "cuda"):
             return self._stream_weights(index, device, dtype)
 
-        hit = resources.prefetch_take(index)
+        placement = (str(torch.device(device)), dtype)
+        prefetch_key = (index, *placement)
+        hit = resources.prefetch_take(prefetch_key)
         if hit is None:
             hit = self._stream_weights(index, device, dtype)
 
         next_index = (index + 1) % len(self.branches)
         if self.branches[next_index] is not None:
+            next_key = (next_index, *placement)
             resources.prefetch_request(
-                next_index,
+                next_key,
                 lambda i=next_index, d=device, t=dtype: self._stream_weights(i, d, t),
             )
         return hit

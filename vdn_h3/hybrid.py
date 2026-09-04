@@ -16,6 +16,7 @@ import comfy.quant_ops
 from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention
 from comfy.patcher_extension import WrappersMP
 
+from vdn_h3.runtime import RuntimeBufferOwner
 from vdn_h3.spec import resolve_branch_weights
 from vdn_h3.window import full_coverage, window_bounds
 
@@ -58,8 +59,10 @@ class VDNLayout:
 
 
 class VDNState:
-    """One Apply-VDN application's immutable branch/config plus reentrant layout."""
-    def __init__(self, name, cfg, branches, num_heads, head_dim, managed_weights=None):
+    """One Apply-VDN application's config, branch ownership and runtime resources."""
+
+    def __init__(self, name, cfg, branches, num_heads, head_dim,
+                 managed_weights=None, retain_buffers=False):
         self.name = name
         self.cfg = cfg
         self.branches = branches
@@ -67,16 +70,40 @@ class VDNState:
         self.head_dim = head_dim
         self.managed_weights = managed_weights
         self.softmax_backend = "grouped"
+        self.runtime = RuntimeBufferOwner(retain_buffers)
         self._layout = contextvars.ContextVar(f"vdn_layout_{id(self)}", default=None)
 
     @property
     def layout(self):
         return self._layout.get()
 
+    @property
+    def retain_buffers(self):
+        return self.runtime.retain
+
+    def _stream_weights(self, index, device, dtype):
+        return resolve_branch_weights(self.branches[index].w, device, dtype)
+
     def weights_on(self, index, device, dtype):
         if self.managed_weights is not None:
             return self.managed_weights.weights_on(index, device, dtype)
-        return resolve_branch_weights(self.branches[index].w, device, dtype)
+
+        resources = self.runtime.current()
+        if (resources is None or not resources.retain
+                or torch.device(device).type != "cuda"):
+            return self._stream_weights(index, device, dtype)
+
+        hit = resources.prefetch_take(index)
+        if hit is None:
+            hit = self._stream_weights(index, device, dtype)
+
+        next_index = (index + 1) % len(self.branches)
+        if self.branches[next_index] is not None:
+            resources.prefetch_request(
+                next_index,
+                lambda i=next_index, d=device, t=dtype: self._stream_weights(i, d, t),
+            )
+        return hit
 
 
 def layout_from_payload(payload, x, context, cfg):
@@ -108,18 +135,27 @@ def make_layout_wrapper(state):
     def wrap(executor, *args, **kwargs):
         layout = layout_from_payload(
             kwargs.get("minimax_payload"), args[0], args[2], state.cfg)
-        token = state._layout.set(layout)
-        _once(
-            ("layout", layout.seq_len, layout.num_frames, layout.tokens_per_frame,
-             tuple(layout.bounds), layout.anchor_frames),
-            f"layout: seq {layout.seq_len}, video [{layout.video_start}, "
-            f"{layout.video_end}), F={layout.num_frames}, S={layout.tokens_per_frame}, "
-            f"window={'dense' if layout.full_cover else layout.bounds[0]}",
-        )
-        try:
-            return executor(*args, **kwargs)
-        finally:
-            state._layout.reset(token)
+        with state.runtime.execution():
+            token = state._layout.set(layout)
+            _once(
+                ("layout", layout.seq_len, layout.num_frames, layout.tokens_per_frame,
+                 tuple(layout.bounds), layout.anchor_frames, state.retain_buffers),
+                f"layout: seq {layout.seq_len}, video [{layout.video_start}, "
+                f"{layout.video_end}), F={layout.num_frames}, S={layout.tokens_per_frame}, "
+                f"window={'dense' if layout.full_cover else layout.bounds[0]}, "
+                f"buffers={'retained' if state.retain_buffers else 'transient'}",
+            )
+            try:
+                return executor(*args, **kwargs)
+            except comfy.model_management.InterruptProcessingException:
+                # All persistent scratch belongs to this VDNState, so a cancelled
+                # execution can release it without touching another node/model.
+                state.runtime.clear()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                raise
+            finally:
+                state._layout.reset(token)
     return wrap
 
 
@@ -167,10 +203,8 @@ def make_vdn_forward(attn, state, block_index):
         if layout is None or base_branch is None:
             return _base_attention(attn, x, rope_freqs, transformer_options)
 
-        # LinearBranch owns only immutable checkpoint references/config plus two small
-        # lazy delta-backend cache fields. ModelPatcher clones share VDNState, so use a
-        # shallow execution copy to prevent different simultaneous frame/text lengths
-        # from racing those cache fields. Tensor storage is still shared.
+        # ModelPatcher clones share VDNState. Keep the small lazy backend selector on
+        # an execution-local shallow branch copy so simultaneous geometry cannot race.
         branch = copy.copy(base_branch)
         branch._backend = None
         branch._backend_key = None
@@ -188,14 +222,36 @@ def make_vdn_forward(attn, state, block_index):
         text_x = text_k_raw = text_v_raw = None
         if linear_active:
             a, b = layout.video_start, layout.video_end
-            q_raw_video = q_raw[a:b].clone()
-            k_raw_video = k_raw[a:b].clone()
-            v_video = v[a:b].clone()
+            resources = state.runtime.current()
+            text_rows = layout.text_len if branch.enable_text_state else 0
+            scratch = (
+                resources.activation_scratch(
+                    b - a, text_rows, heads, head_dim, device, dtype)
+                if resources is not None else None
+            )
+            if scratch is None:
+                q_raw_video = q_raw[a:b].clone()
+                k_raw_video = k_raw[a:b].clone()
+                v_video = v[a:b].clone()
+            else:
+                q_raw_video = scratch["q"]
+                k_raw_video = scratch["k"]
+                v_video = scratch["v"]
+                q_raw_video.copy_(q_raw[a:b])
+                k_raw_video.copy_(k_raw[a:b])
+                v_video.copy_(v[a:b])
+
             if branch.enable_text_state and layout.text_len:
                 ta, tb = layout.text_start, layout.text_start + layout.text_len
                 text_x = x[ta:tb]
-                text_k_raw = k_raw[ta:tb].clone()
-                text_v_raw = v[ta:tb].clone()
+                if scratch is None:
+                    text_k_raw = k_raw[ta:tb].clone()
+                    text_v_raw = v[ta:tb].clone()
+                else:
+                    text_k_raw = scratch["tk"]
+                    text_v_raw = scratch["tv"]
+                    text_k_raw.copy_(k_raw[ta:tb])
+                    text_v_raw.copy_(v[ta:tb])
 
         if rope_freqs is not None:
             q4 = q.view(1, s, heads, head_dim)
@@ -224,14 +280,14 @@ def make_vdn_forward(attn, state, block_index):
                     backend = "grouped"
                     _log.warning(
                         "[vdn] flex attention failed (%s); falling back to grouped SDPA "
-                        "for this execution",
-                        exc)
+                        "for this execution", exc)
             if backend != "flex":
-                from vdn_h3.window import window_softmax_grouped
-                softmax_out = window_softmax_grouped(
+                from vdn_h3.retained import window_softmax_grouped_runtime
+                softmax_out = window_softmax_grouped_runtime(
                     q, k, v, layout.video_start, layout.video_end,
                     layout.num_frames, layout.tokens_per_frame, layout.bounds,
-                    head_dim ** -0.5, anchor_frames=cfg["anchor_frames"])
+                    head_dim ** -0.5, anchor_frames=cfg["anchor_frames"],
+                    transformer_options=transformer_options)
         else:
             qc = AttentionTensorContainer(q.transpose(0, 1).unsqueeze(0))
             kc = AttentionTensorContainer(k.transpose(0, 1).unsqueeze(0))
@@ -247,7 +303,10 @@ def make_vdn_forward(attn, state, block_index):
             gate = torch.sigmoid(F.linear(
                 x, weights["softmax_gate.up.weight"],
                 weights["softmax_gate.up.bias"]))
-            flat = (softmax_out * gate.view(s, heads, 1).to(softmax_out.dtype)).reshape(s, -1)
+            flat = (
+                softmax_out
+                * gate.view(s, heads, 1).to(softmax_out.dtype)
+            ).reshape(s, -1)
         else:
             flat = softmax_out.reshape(s, -1)
         out = out_proj(flat.type_as(x))

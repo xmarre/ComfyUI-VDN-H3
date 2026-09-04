@@ -211,16 +211,23 @@ def find_dense_time_embedder(stage_path: str, table: torch.Tensor) -> tuple[Dens
     t_grid = torch.arange(rows, dtype=torch.float32) / float(rows - 1)
 
     local = os.path.join(stage_path, TIME_EMBEDDER_FILENAME)
-    candidates = [local] if os.path.isfile(local) else []
-    seen = {os.path.realpath(local)} if candidates else set()
-    for path in _candidate_dense_checkpoints():
-        real = os.path.realpath(path)
-        if real not in seen:
-            candidates.append(path)
-            seen.add(real)
+    local_exists = os.path.isfile(local)
+    if local_exists:
+        # A deliberately colocated companion is an explicit operator choice. Never
+        # mask a stale/wrong companion by silently falling through to another model.
+        candidates = [local]
+    else:
+        candidates = []
+        seen = set()
+        for path in _candidate_dense_checkpoints():
+            real = os.path.realpath(path)
+            if real not in seen:
+                candidates.append(path)
+                seen.add(real)
 
     best = None
     errors = []
+    local_real = os.path.realpath(local)
     for path in candidates:
         try:
             identity = _file_identity(path)
@@ -230,7 +237,7 @@ def find_dense_time_embedder(stage_path: str, table: torch.Tensor) -> tuple[Dens
                 embedder, residual = cached
             else:
                 header = _safetensors_header(path)
-                if os.path.realpath(path) == os.path.realpath(local):
+                if local_exists and os.path.realpath(path) == local_real:
                     prefix = ""
                 else:
                     prefix = _find_dense_prefix(header)

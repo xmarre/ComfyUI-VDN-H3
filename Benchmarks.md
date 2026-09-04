@@ -8,7 +8,7 @@ The current implementation differs materially from the runs below:
 - VDN no longer traverses, splices or restores mutable `module.forward` LoRA chains;
 - the old private GPU branch cache is replaced by either bounded streaming or a Comfy-managed additional `ModelPatcher`;
 - safetensors mappings are bounded to load operations rather than retained process-global handles;
-- curve/pruned AdaLN adapter handling is exact and fail-closed instead of silently dropping or projecting learned weights;
+- curve/pruned AdaLN adapters are projected through the exact pruning affine (`adaln_basis` + `adaln_mean`) onto the native curve coordinates, including their constant bias term, rather than dropping weights or running a reconstructed dense timestep MLP;
 - selected upstream v1.4 performance ideas are adapted under state-owned lifecycle rules: VRAM-aware branch selection, native INT8 ConvRot streaming under pressure, execution-leased retained scratch, and one-block streaming prefetch;
 - `auto` placement reserves still-unloaded base-model bytes before deciding that VDN may consume free VRAM.
 
@@ -85,11 +85,41 @@ Upstream v1.4 benchmark numbers therefore remain useful motivation/reference dat
 
 Normal Comfy `ModelPatcher.add_patches()` application. This is the reference/eager path for output comparison. Quantized bases can incur a temporary dequantize -> patch -> requantize VRAM spike during eager materialization.
 
+On a curve/pruned base, a released full-width AdaLN LoRA is first transformed through the base's pruning affine. The projected low-rank weight update and its constant F32 bias term are then registered as ordinary Comfy patches.
+
 ### `lora_mode=bypass`
 
 The current low-VRAM runtime path uses Comfy `add_weight_wrapper()` / `weight_function` ownership. It does not modify `module.forward`, does not create VDN LoRA injections, and leaves the resident base parameter unmerged. Low-rank Stage-B/Turbo terms are applied to the floating compute weight Comfy produces for the current invocation; the implementation avoids constructing a second persistent full-size patched model weight.
 
+For curve/pruned AdaLN targets, the projected A/B factors and F32 constant bias offsets live in the same Comfy-managed additional model. Separate weight and bias wrappers apply them to the native small AdaLN projection. There is no dense timestep MLP and no AdaLN `forward` object patch in this path.
+
 On INT8/custom-weight layers, a runtime weight wrapper can force a dequantized compute fallback for the patched invocation instead of the fused quantized kernel. The tradeoff is therefore lower patched-weight residency/load pressure versus potentially higher per-call compute cost. This must be measured rather than inferred.
+
+## Curve/pruned AdaLN projection
+
+For the supported pruned MiniMax-H3 lineage, the dense AdaLN input is represented by the pruning affine
+
+```text
+dense(t) ≈ mean + curve(t) @ basis
+```
+
+A released full-width LoRA `B @ A` is therefore converted once as
+
+```text
+A_pruned   = A @ basis.T
+bias_delta = B @ (A @ mean)
+```
+
+The projection math is performed once in float64. Projected A and the constant bias term are stored as F32; B retains its checkpoint storage dtype until Comfy selects the invocation compute dtype. This adds no new model approximation beyond the pruned base's existing affine representation. The constant term is required; dropping it would not reproduce the affine-projected adapter.
+
+The affine resolver accepts only the exact pruning basis/mean corresponding to the loaded curve table:
+
+- stage-local `adaln_affine.safetensors` is the explicit companion path;
+- the selected diffusion checkpoint and sibling safetensors are searched first;
+- installed `models/diffusion_models` candidates are also searched;
+- installed candidates must carry the matching curve table or a matching table identity; a different or unverified basis fails closed.
+
+The repaired BF16 pruned source checkpoint can retain `adaln_basis` and `adaln_mean`; its INT8 derivatives may intentionally omit those inference-unused auxiliaries. Keeping the matching BF16 sibling installed is sufficient—the resolver reads only the tiny affine tensors/table from it. Otherwise `tools/extract_h3_adaln_affine.py` writes an approximately 97 KB sidecar.
 
 ## Current branch residency modes
 
@@ -139,8 +169,9 @@ CI validates implementation contracts rather than performance:
 - pinned ComfyUI: `6c53f8c9a06d95f3d847009ceaae55c624169247`;
 - official OpenVDN oracle: `b8cb28fbfca0266d1c7742a9f25ab8b58191de97`;
 - direct reduced-dimension source-to-source oracle comparisons, including the official `HybridAttention` class;
-- adapter conversion including fused variable-rank/scaled QKV patches;
-- curve/pruned exact-AdaLN reconstruction tests;
+- adapter conversion including hybrid/dense/token-refiner naming and fused variable-rank/scaled QKV patches;
+- curve/pruned affine AdaLN projection tests, including the constant bias term, merge/runtime lifecycle, file replacement invalidation, wrong-table rejection and the production 51-target shape;
+- direct KJ-loader-style selected-INT8 + matching-BF16-sibling affine discovery regression;
 - ModelSpec and checkpoint corruption/invalidation tests;
 - merge-path custom/quantized weight lifecycle tests;
 - runtime-low-VRAM wrapper tests showing no forward hooks, no resident base-weight mutation and no adapter accumulation;
@@ -151,14 +182,23 @@ CI validates implementation contracts rather than performance:
 - repeated clone/load/unload and pseudo-Continuum conditioning/forward cycles;
 - current Comfy `master` import/node-registration smoke.
 
-Synthetic CPU tests intentionally do not stand in for real GPU VRAM, kernel selection, output quality or end-to-end performance.
+The expanded suite is expected to contain **110 tests** after the KJ sibling-affine regression. Synthetic CPU tests intentionally do not stand in for real GPU VRAM, kernel selection, output quality or end-to-end performance.
+
+## Production GPU validation status
+
+The target RTX Pro 6000 / INT8-ConvRot workflow has already validated two important pre-sampling gates:
+
+- `branch_weights=auto` correctly selected the quantized VDN branch and kept it streamed under the managed-lifecycle policy;
+- released Stage-B/Turbo attention names are now converted to current Comfy fused `qkv_proj`/`out_proj` targets instead of failing on unfused names.
+
+The next production attempt then reached the 51 full-width Turbo AdaLN targets and stopped before sampling because the older implementation required a dense time embedder. That requirement is what the new pruning-native affine projection replaces. The same workflow must now be rerun before any end-to-end performance or quality conclusion is drawn.
 
 ## Required real GPU matrix
 
 Before claiming current-branch performance, output parity, or VRAM savings, collect matched fixed-seed runs for at least:
 
 - BF16 MiniMax-H3 base;
-- pruned/curve base with exact dense-AdaLN reconstruction;
+- pruned/curve base with verified affine AdaLN projection;
 - INT8 ConvRot base;
 - `stage-dmd-step-250` with Turbo/DMD adapter at 8 steps;
 - `stage-b-step-2000` without Turbo at the intended longer schedule;
@@ -189,4 +229,4 @@ For every matched run record:
 - whether patched INT8 layers remained on their fused kernel or used the dequantized runtime fallback;
 - fixed-seed visual/audio comparison against `merge`.
 
-The critical lifecycle gate is a real Continuum run beyond chunk 1: chunk 2+ must reach actual H3 transformer evaluations, repeated runs must not accumulate adapters, and no VDN LoRA `module.forward` chain should exist.
+The critical lifecycle gate is a real Continuum run beyond chunk 1: Apply must resolve/project all 51 Turbo AdaLN targets, chunk 2+ must reach actual H3 transformer evaluations, repeated runs must not accumulate adapters, and no VDN LoRA `module.forward` chain should exist.

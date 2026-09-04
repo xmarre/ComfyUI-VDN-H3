@@ -7,10 +7,10 @@ gate]. This module rewrites adapter tensors onto ComfyUI module paths in memory 
 load time; nothing on disk is converted.
 
 Fusion of three per-projection LoRA pairs (to_q/to_k/to_v) into one fused-qkv pair is
-exact: delta_W = concat(B_i @ A_i) = B_fused @ A_fused with A_fused = vstack(A_i) and
-B_fused block-diagonal. The released adapters use one rank/alpha scale across each
-Q/K/V triplet; malformed or incompatible triplets fail closed rather than producing a
-shape that is rejected later by ModelPatcher.
+exact: each source projection contributes ``scale_i * (B_i @ A_i)``. The fused A is
+the concatenation of all ranks and the fused B is block diagonal, with per-projection
+scale absorbed into its B block when necessary. Different Q/K/V ranks and alpha/rank
+values therefore remain representable without approximation.
 """
 import torch
 
@@ -91,8 +91,9 @@ def _require_pair(module, sides):
 def convert_adapter(sd, adapter_cfg):
     """{diffusers module: {A, B}} -> {comfy module: (lora_A, lora_B, scale)}.
 
-    qkv targets fold into one block-diagonal pair; swiglu halves swap; refiner keys
-    reroot onto ComfyUI's token_refiner.blocks naming."""
+    qkv targets fold into one variable-rank block-diagonal pair; swiglu halves swap;
+    refiner keys reroot onto ComfyUI's token_refiner.blocks naming.
+    """
     parsed = parse_adapter_state(sd)
     qkv_groups = {}
     out = {}
@@ -136,30 +137,28 @@ def convert_adapter(sd, adapter_cfg):
         ranks = [item[1].shape[0] for item in ordered]
         input_dims = [item[1].shape[1] for item in ordered]
         output_dims = [item[2].shape[0] for item in ordered]
-        scales = [item[3] for item in ordered]
-        if len(set(ranks)) != 1:
-            raise ValueError(
-                f"mixed LoRA ranks across Q/K/V projections of {path}: {ranks}; "
-                "released VDN checkpoints use one rank per fused triplet")
+        scales = [float(item[3]) for item in ordered]
         if len(set(input_dims)) != 1 or len(set(output_dims)) != 1:
             raise ValueError(
                 f"incompatible Q/K/V projection shapes for {path}: "
                 f"input={input_dims}, output={output_dims}")
-        if len(set(scales)) != 1:
-            raise ValueError(
-                f"mixed alpha/rank across Q/K/V projections of {path}: {scales}; "
-                "cannot preserve post-matmul LoRA scaling in one fused patch")
 
-        rank = ranks[0]
+        # Preserve a common external scale when possible. Otherwise absorb each
+        # projection's scale into its B block and expose a unit aggregate scale.
+        common_scale = scales[0] if len(set(scales)) == 1 and scales[0] != 0.0 else 1.0
+        total_rank = sum(ranks)
         out_dim = output_dims[0]
-        a_fused = torch.cat([item[1] for item in ordered], dim=0)  # [3r, in]
-        b_fused = torch.zeros(out_dim * 3, rank * 3, dtype=a_fused.dtype)
-        for i, (_mod, _a, b, _scale) in enumerate(ordered):
-            b_fused[i * out_dim:(i + 1) * out_dim,
-                    i * rank:(i + 1) * rank] = b
+        a_fused = torch.cat([item[1] for item in ordered], dim=0)  # [sum(r_i), in]
+        b_fused = torch.zeros(out_dim * 3, total_rank, dtype=a_fused.dtype)
+        col = 0
+        for i, (_mod, _a, b, scale) in enumerate(ordered):
+            rank = b.shape[1]
+            b_fused[i * out_dim:(i + 1) * out_dim, col:col + rank] = (
+                b * (float(scale) / common_scale))
+            col += rank
         if path in out:
             raise ValueError(f"multiple adapter modules map to ComfyUI target {path}")
-        out[path] = (a_fused, b_fused, scales[0])
+        out[path] = (a_fused, b_fused, common_scale)
     return out
 
 

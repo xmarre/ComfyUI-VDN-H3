@@ -63,11 +63,8 @@ def _validate_branch_shapes(path, branches, cfg, hidden, heads, head_dim):
 def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
                attention_backend, verbose, apply_turbo_adapter=True,
                cfg_overrides=None, fast_kernels=False):
-    if lora_mode != "merge":
-        # Old workflows can still deserialize the removed value and get a useful error.
-        raise RuntimeError(
-            "VDN bypass adapters were removed because mutable module.forward chains "
-            "are not clone/Continuum lifecycle-safe. Set lora_mode to 'merge'.")
+    if lora_mode not in ("merge", "bypass"):
+        raise ValueError(f"lora_mode must be merge or bypass, got {lora_mode!r}")
     if branch_weights == "cache_gpu":
         # Migration for old serialized workflows; the UI now calls this resident and
         # gives ownership to a Comfy additional ModelPatcher.
@@ -176,10 +173,10 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
     )
     _log.info(
         "[vdn] %s applied: blocks=%d radius=%d chunk=%d anchors=%s rule=%s "
-        "branch=%s backend=%s adapters=%s",
+        "branch=%s backend=%s lora_mode=%s adapters=%s",
         vdn_checkpoint, len(branches), cfg["radius"], cfg["chunk"],
         cfg["anchor_frames"], cfg["delta_rule"], branch_weights,
-        attention_backend, report)
+        attention_backend, lora_mode, report)
     return (new_model,)
 
 
@@ -198,10 +195,11 @@ class ApplyVDNH3:
             "strength": ("FLOAT", {
                 "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
                 "tooltip": "Adapter strength. 1.0 is the released checkpoint setting."}),
-            "lora_mode": (["merge"], {
+            "lora_mode": (["merge", "bypass"], {
                 "default": "merge",
-                "tooltip": "ComfyUI-native weight patches with explicit backup/restore. "
-                           "The former runtime forward-bypass mode was removed."}),
+                "tooltip": "merge uses normal Comfy weight patches. bypass is the "
+                           "low-VRAM runtime mode: Comfy weight_function wrappers apply "
+                           "the LoRA per layer without VDN touching module.forward."}),
             "branch_weights": (["stream", "resident"], {
                 "default": "stream",
                 "tooltip": "stream resolves one branch block from the checkpoint when "
@@ -242,7 +240,10 @@ class ApplyVDNH3Advanced:
                 "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
             "turbo_strength": ("FLOAT", {
                 "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
-            "lora_mode": (["merge"], {"default": "merge"}),
+            "lora_mode": (["merge", "bypass"], {
+                "default": "merge",
+                "tooltip": "bypass uses the safe runtime low-VRAM weight-wrapper path; "
+                           "it does not install forward hooks/chains."}),
             "branch_weights": (["stream", "resident"], {"default": "stream"}),
             "verbose": ("BOOLEAN", {"default": False}),
             "attention_backend": (["grouped", "flex"], {"default": "grouped"}),

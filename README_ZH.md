@@ -1,244 +1,285 @@
-# ComfyUI-VDN-H3 — 面向 MiniMax-H3 的 VDN-H3(Video Delta Net)混合注意力
+# ComfyUI-VDN-H3 — MiniMax-H3 的 VDN-H3
 
-<img width="1039" height="505" alt="image" src="https://github.com/user-attachments/assets/ab4c1691-bff5-46fe-8b3e-635429b0700f" />
+<img width="1039" height="505" alt="VDN-H3" src="https://github.com/user-attachments/assets/ab4c1691-bff5-46fe-8b3e-635429b0700f" />
 
-**[English](README.md)** | 中文
+**[English](README.md)**
 
-将 Video Delta Net 混合注意力以原生 ComfyUI 节点的形式带入 MiniMax-H3:邻近帧
-保留精确 softmax 注意力,远距离时序上下文交给检查点中的 **Video Delta
-Attention** 线性分支,把平方级的长距离注意力替换为常数成本的循环状态。
+这是 [OpenVDN VDN-H3](https://github.com/OpenVDN/vdn-minimax-h3) 发布版混合注意力架构在 ComfyUI 原生 MiniMax-H3 模型上的移植。
 
-参考实现:[OpenVDN/vdn-minimax-h3](https://github.com/OpenVDN/vdn-minimax-h3)
-(Apache-2.0)。权重:[OpenVDN/vdn-minimax-h3](https://huggingface.co/OpenVDN/vdn-minimax-h3)
-(MiniMax H3 社区许可证 —— **使用前请阅读**,该许可证排除部分地区)。
+VDN-H3 在局部帧窗口内保留精确 softmax 注意力，并用双向 Video Delta Attention 线性分支覆盖窗口外的长距离时序上下文。本仓库直接读取官方 VDN stage 目录，不修改 ComfyUI 核心文件。
 
-本包是**移植而非分叉**:在 ComfyUI 原生 MiniMax-H3 模型上以运行时模型补丁的
-方式复现官方混合注意力数学,不修改任何 ComfyUI 核心文件。
+## 保留的发布架构
 
-**这个仓库存在的意义(以及它不是什么)。** 官方 VDN-H3 发布版面向数据中心技术栈:8× B200 GPU 的 Ulysses 序列并行,以及仅支持 Hopper 和数据中心级 Blackwell 的 FlashAttention-4 内核 —— 消费级 Blackwell(sm_120)不受支持,也没有 Windows 构建。上游还使用了 FP8 线性层和定制融合 Triton 内核;本移植用可在任何 ComfyUI 环境运行的纯 PyTorch 等价实现替代了这些。
+默认按照检查点 `model_spec.json` 执行，包括：
 
-你能得到:相同的发布检查点与相同的架构 —— 窗口 softmax + Video Delta Attention 线性分支,并对官方实现做了单元测试验证 —— 零新增依赖。8 步蒸馏模型、相对稠密 H3 近乎无损的质量,以及随片段长度线性(而非平方)增长的注意力成本 —— 视频越长,收益越大。
+- MiniMax-H3 text/video/audio 打包布局；
+- frame/chunk 对齐 softmax window；
+- `none` / `rows` / `columns` / `both` anchor；
+- 线性分支共享 QKNorm/RoPE 前的原始 Q/K/V；
+- 检查点指定的 separable short-conv；
+- beta、逐帧 KDA alpha 和 delta rule；
+- 正向/反向 recurrent scan；
+- 可选 text-state 和 alpha bridge；
+- branch RMSNorm/output gate/`to_out_linear`；
+- 可选 softmax gate；
+- window 覆盖整个 clip 时走精确 dense-attention fallback。
 
-你得不到:头条数字。官方 74.5 倍来自 8 卡并行 + FA4 + FP8 + 8 步蒸馏的组合;上游自己的单卡实测为 50 步约 2.6 倍,而本移植的通用内核略低于此(RTX 5090、1280×736 / 145 帧实测约 17 秒/it —— 见 Benchmarks.md)。想在自己的硬件上试验这套架构,这就是为你准备的;想要实时流式生成的数字,那需要他们的 B200 集群。
-
-**硬件现实检查。** 这不是运行 MiniMax-H3 最快或最轻量的方式 —— 这是一个实验性的 PyTorch 移植,用相似的数学复现相似的结果。本节点在每个 transformer 块、每个采样步上都要额外运行一个线性分支网络,所需算力与显存远高于 int8 融合注意力(comfy-kitchen)、SageAttention、SOL 或 SLA —— 用那些方法,同样的显卡大约能跑两倍的分辨率与时长。换来的是:片段越长、分辨率越高,收益越大 —— VDN 的注意力开销随时长线性增长而非平方增长 —— 前提是你的显存喂得饱它。上游方法面向 8× B200 数据中心 GPU 集群设计,并非消费级硬件。**显存或内存紧张的话,不建议使用本仓库/模型/方法。**
-
-| CK、Sol-attn、res_multi / simple —— 20 步，1280x736，3:05 | LightXv2 4-Step Turbo v1.1、CK、Sol-attn、er_sde / beta —— 8 步，1280x736，1:24 |
-|:---:|:---:|
-| <video src="https://github.com/user-attachments/assets/7120657d-af61-4414-b621-53b39208ffe0" controls></video> | <video src="https://github.com/user-attachments/assets/b0373566-fc78-4616-b591-13462c4b50e6" controls></video> |
-
-| VDN-H3 Turbo、er_sde / beta —— 8 步，1280x736，2:04 | VDN-H3 高级 fast_kernels Turbo、er_sde / beta —— 8 步，1280x736，1:13 |
-|:---:|:---:|
-| <video src="https://github.com/user-attachments/assets/89cc7155-ca89-459e-9996-5b5f6bfcd284" controls></video> | <video src="https://github.com/user-attachments/assets/5cc9906e-acec-4c61-a3b9-17c79153945b" controls></video> |
-
-<details>
-<summary><strong>VDN-H3 bf16 与 INT8 ConvRot —— A/B 视频（相同种子与设置）—— 点击展开</strong></summary>
-
-| VDN-H3 bf16 stage、er_sde / beta —— 8 步，1280x736，1:51 | VDN-H3 INT8 ConvRot stage、er_sde / beta —— 8 步，1280x736，1:35 |
-|:---:|:---:|
-| <video src="https://github.com/Saganaki22/ComfyUI-VDN-H3/releases/download/exp-int8-media/ab_bf16_8step_er_sde_beta.mp4" controls loop></video> | <video src="https://github.com/Saganaki22/ComfyUI-VDN-H3/releases/download/exp-int8-media/ab_int8convrot_8step_er_sde_beta.mp4" controls loop></video> |
-
-两侧种子与设置完全相同（merge、`cache_gpu`），仅 stage 不同。INT8 stage 的
-分支矩阵乘法快 2.7 倍，此单次 A/B 端到端快约 1.2 倍，输出一致。
-
-</details>
-
-**Ref2V 示例（INT8 ConvRot stage）** —— ref2va 基座，8 步，er_sde / beta，
-768x768：
-
-https://github.com/user-attachments/assets/65fd49e1-a4a3-4e28-9f3d-9dc8337354a7
-
-### 相同种子
-
-`981445682258077`
+Advanced 节点默认 `architecture_mode=checkpoint`。只有显式选择 `override` 后才会应用架构消融字段，这些设置不声称与训练时检查点一致。
 
 ## 安装
-
-1. 克隆到 `ComfyUI/custom_nodes/` 并重启 ComfyUI:
 
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/Saganaki22/ComfyUI-VDN-H3
 ```
 
-2. 将需要的 VDN 检查点下载到 `ComfyUI/models/vdn/`:
+保持官方目录结构下载到 `ComfyUI/models/vdn/`：
 
 ```bash
-hf download OpenVDN/vdn-minimax-h3 --include "stage-dmd-step-250/*" --local-dir <ComfyUI>/models/vdn
+hf download OpenVDN/vdn-minimax-h3 \
+  --include "stage-dmd-step-250/*" \
+  --local-dir <ComfyUI>/models/vdn
 ```
 
-请保持发布目录结构不变(`model_spec.json`、`linear_branch/`、`adapters/`)。
-磁盘上不做任何转换 —— 节点在内存中把 diffusers 格式的张量键映射到 ComfyUI
-的模块路径。
+官方当前 stage：
 
-**无需安装任何新 Python 依赖。** 节点以 ComfyUI 自带的 PyTorch(torch +
-safetensors)运行官方数学,不需要 Triton、flash-attn-4、CUDA 编译或
-`pip install`。
+- `stage-dmd-step-250`：8-step VDN-H3，包含 Turbo/DMD adapter；
+- `stage-b-step-2000`：50-step VDN-H3，包含 Stage-B/default adapter。
+
+**模型/检查点权重不是 Apache-2.0。** 下载或使用前请阅读“许可证与来源”。
 
 ## 节点
 
-**Apply VDN-H3 (MiniMax-H3 Hybrid Attention)** —— `MODEL -> MODEL`
+### Apply VDN-H3
+
+`MODEL -> MODEL`
 
 | 输入 | 含义 |
 |---|---|
-| `vdn_checkpoint` | `models/vdn` 下的某个 stage 目录 |
-| `apply_turbo_adapter` | 开 = 官方 **8 步** 模型(采样器用 8 步);关 = **50 步** 模型(约 50 步) |
-| `strength` | 适配器强度,1.0 即发布模型 |
-| `lora_mode` | **`merge`**(默认;适配器合并进权重——精确复现验证过的模型)/ `bypass`(运行时注入) |
+| `vdn_checkpoint` | `models/vdn/` 下的官方 stage |
+| `apply_turbo_adapter` | stage 存在 Turbo/DMD adapter 时应用；发布的 8-step DMD stage 需要开启 |
+| `strength` | adapter 强度；`1.0` 为发布设置 |
+| `lora_mode` | `merge` 或安全 runtime `bypass` |
+| `branch_weights` | `auto` / `stream` / `resident`；控制 **VDN linear branch**，不是 LoRA 模式 |
+| `retain_buffers` | `auto` / `on` / `off`；控制可复用 scratch，不是模型权重 |
+| `attention_backend` | 默认 `grouped`，或可选 `flex` |
+| `verbose` | 额外布局/adapter 日志 |
 
-> **`lora_mode` —— 请用 `merge`,8 步 DMD 检查点(`stage-dmd-*`)尤其必须。**
-> 在剪枝 int8 基座上实测:bypass 应用的是同样的适配器,但每个模块的增量以
-> bf16 舍入噪声的形式叠加,而不是烧进权重。前 34 个块与 merge 逐位一致;
-> 深层块(34+)会把这部分噪声放大到特征幅度的约 10%,8 步模型的 bypass
-> 渲染全部出现颗粒感/劣化。同样大小的连贯扰动(强度 1.016)渲染干净——
-> 问题特定于脱离流形的舍入噪声,而非增量数学本身。stage-dmd-* 必须用
-> merge;非 DMD 检查点仍可使用 bypass。
-| `branch_weights` | `stream`(权重按块逐步从磁盘直读进 GPU——不在内存中额外驻留;小显存安全)/ `cache_gpu`(常驻显存,更快,需预留约 4.3 GB) |
-| `attention_backend` | `grouped`(默认;每个窗口组一次稠密 SDPA)/ `flex`(单个编译的 FlexAttention 内核;可选,见 Benchmarks.md) |
-| `verbose` | 输出已应用的适配器和每次前向的布局日志 |
+### Apply VDN-H3 Advanced
 
-把它接在 MiniMax-H3 加载器和采样器之间即可;条件、LoRA、采样器、VAE 解码
-和视频/音频输出节点都不需要改动。示例工作流:`example_workflows/vdn_h3_t2v_8step.json`。
+增加独立 Stage-B/Turbo 强度、可选 fast kernels 和显式架构消融。`architecture_mode=checkpoint` 为默认；只有选择 `override` 后 `window_radius`、`window_chunk`、`anchor_frames`、`text_state`、`linear_branch` 才生效。
 
-**Apply VDN-H3 Advanced** —— 包含基础节点全部功能,另加面向实验者的:
+## LoRA adapter 模式
 
-| 输入 | 含义 |
-|---|---|
-| `stage_b_strength` / `turbo_strength` | 两套适配器各自独立强度(基础节点是单一全局强度) |
-| `window_radius`、`window_chunk` | 偏离训练窗口 c=5 r=1(消融实验) |
-| `anchor_frames` | `both` / `columns` / `rows` / `none`(训练值 `both`) |
-| `text_state` | 初始化时把提示词写入线性分支状态(训练值:开) |
-| `linear_branch` | 关 = 仅窗口消融(调试;长片段将失去全部长距离上下文) |
-| `fast_kernels` | torch.compile 把分支热点(RMSNorm+门控尾声、状态收集、帧主序 q 存储)融合为单内核(数学相同;编译失败自动回退 eager) |
+`lora_mode`、`branch_weights`、`retain_buffers` 分别解决不同显存问题，可以独立组合。
 
-消融输入偏离检查点训练规格时会在控制台警告;全部默认值精确复现发布模型。
+### `lora_mode=merge`
 
-## 注意力后端与叠加
+- 使用正常 `ModelPatcher.add_patches()`；
+- backup/restore、load/offload、自定义权重转换和重新量化由 Comfy 管理；
+- 仍是质量/数值验证的 reference/eager 路径；
+- 量化基座可能产生较大的 eager dequantize -> patch -> requantize 临时显存峰值。
 
-VDN 的窗口 softmax 始终使用精确 SDPA —— 经由 ComfyUI 的后端优先级链分发
-(flash / cuDNN / mem-efficient),但绝不经过量化后端:让窗口走 sage/kitchen
-int8 会明显降低输出质量,而发布模型验证的是精确的局部注意力。后端 override
-补丁(SageAttention、kitchen-int8、KJNodes)仍作用于基座模型自身的注意力
-(文本精炼器,以及极短片段的稠密回退)。线性分支不经过 softmax 内核,不受
-后端补丁影响。
+### `lora_mode=bypass` — 安全 runtime 低显存路径
 
-**请勿将 "MiniMax H3 Scheduled Sol Attention" 补丁与本节点叠加。** 它替换的
-`blocks.*.attn.forward` 与 VDN 是同一路径 —— 凡由 SOL 处理的调用,VDN 的线性
-分支都会被跳过,此时运行的已不再是 VDN-H3(VDN 的 LoRA 被用在了未经其训练的
-注意力上)。纯 H3 跑 SOL;VDN 就跑 VDN。SOL 的 FFN 分块节点与通用注意力 override
-则可以叠加。
+保留 `bypass` 名字用于 workflow 兼容，但**不再使用旧 `BypassForwardHook`**。
 
-## 所需模型
+当前实现：
 
-| 组件 | 文件 | 来源 | 放置于 |
-|---|---|---|---|
-| 基座扩散模型 | `minimax_h3_fl2va_int8_convrot.safetensors`(torch cu130 推荐;仅当无法使用时才选 `fp8_scaled` 变体) | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) | `models/diffusion_models` |
-| 文本编码器 | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) | `models/text_encoders` |
-| 视频 VAE | `minimax_h3_video_vae_fp16.safetensors` | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) | `models/vae` |
-| 音频 VAE | `minimax_h3_audio_vae_fp32.safetensors` | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) | `models/vae` |
-| VDN 分支 + 适配器 | `stage-dmd-step-250/`(8 步)和/或 `stage-b-step-2000/`(50 步) | [OpenVDN/vdn-minimax-h3](https://huggingface.co/OpenVDN/vdn-minimax-h3) | `models/vdn` |
+- 使用 Comfy 公共 `ModelPatcher.add_weight_wrapper()` / `weight_function` 生命周期；
+- 不替换、遍历、拼接或恢复 LoRA 目标的 `module.forward`；
+- 不安装 VDN LoRA `PatcherInjection`、`_vdn_live_hooks` 或私有 forward owner；
+- base parameter 保持未合并；
+- LoRA factor 放在独立的 Comfy-managed additional `ModelPatcher` 中，而不是私有 GPU cache；
+- 同一目标的 Stage-B/Turbo 项合并为一个 runtime wrapper；
+- 每次只创建当前 layer 的临时 compute weight；
+- `B @ A` 按输出行分块计算，再按 merge 风格执行 scale/add；额外 delta 临时 buffer 上限为 8 MiB，而不是另一份完整 weight；
+- 保留检查点 factor 存储 dtype，并使用 Comfy 选择的 LoRA compute dtype；
+- 每次不同 Apply 配置使用不同 runtime ownership key，避免不同 strength/config 被错认成相同已加载状态；同一次 Apply 的 clone 仍保持等价。
 
-VDN 发布版**不包含基座权重** —— 只有分支与 LoRA 适配器,运行时应用到你加载
-的任意 MiniMax-H3 基座上。HF 仓库里 72 GB 的 diffusers 基座(`h3-base/`)
-**不需要**。
+这样恢复低显存 adapter 选项，同时不再引入曾导致 Continuum 在 chunk 2 第一次 transformer evaluation 之前递归崩溃的跨 provider `module.forward` 链。
 
-**已在 `fl2v`(fl2va)与 `ref2v`(ref2va)两种 MiniMax-H3 基座模型上测试,均可正常工作。**
+对 fused/quantized MiniMax-H3，Comfy cast 路径仍是唯一权威。runtime wrapper 可能使对应 INT8 layer 本次调用走反量化 compute fallback，因此必须在真实 workflow 上测量速度/显存。
 
-下载你想要的 VDN 检查点 stage 到 `ComfyUI/models/vdn/`:
+历史 bypass 测试使用的是旧 activation-level forward-hook 实现，不能代表新的 weight-level runtime 路径。完成匹配 GPU render 前，Stage-DMD 质量对照仍以 `merge` 为 reference。
+
+## Curve / pruned MiniMax-H3
+
+部分 MiniMax-H3 检查点把 dense AdaLN timestep 表示压缩为 `adaln_t_table` 等小型坐标表。支持的 pruned 模型谱系使用如下 affine 近似：
+
+```text
+dense(t) ≈ mean + curve(t) @ basis
+```
+
+发布版 VDN Turbo adapter 中包含完整宽度 AdaLN LoRA。对于一个 `B @ A` 更新，VDN 现在只做一次 pruning-native 投影：
+
+```text
+A_pruned   = A @ basis.T
+bias_delta = B @ (A @ mean)
+```
+
+两个部分都必须保留；常数 `bias_delta` 不能省略，也不会静默丢弃。
+
+投影使用存储的 adapter 和 pruning-affine tensor 在 float64 中一次性计算。投影后的 A 和常数 bias offset 保存为 float32；B 保留检查点存储 dtype，直到 Comfy 选择本次调用的 compute dtype。这不会在 pruned base 已有的 affine 近似之外再引入新的模型近似，但也不声称与原始未剪枝 dense timestep MLP bitwise 相同。
+
+运行时仍直接使用 pruned 模型的原生小宽度 AdaLN：
+
+- sampling loop 中不重建或执行 dense timestep MLP；
+- 不替换 AdaLN `forward`；
+- `merge` 把投影后的 low-rank weight 更新和常数 bias 作为普通 Comfy patch；
+- `bypass` 把投影后的 A/B 和 float32 bias offset 放进同一个 Comfy-managed additional model，并通过 Comfy weight/bias wrapper 应用。
+
+### pruning affine 的解析
+
+必须使用与当前 `adaln_t_table` 对应的**准确** `adaln_basis` + `adaln_mean`；不同模型的 basis 不能互换。解析顺序：
+
+1. 当前 VDN stage 下的 `adaln_affine.safetensors`；
+2. 当前选择的 diffusion checkpoint 及其同目录 sibling `.safetensors`；
+3. `models/diffusion_models` 中其它已安装候选。
+
+已安装 checkpoint 候选必须能证明其 curve table 与当前 base 相同；table 不匹配或无法验证的 affine 会 fail closed。
+
+对于修复后的 pruned MiniMax-H3 Comfy 模型谱系，BF16 源文件可以保留 `adaln_basis` 和 `adaln_mean`，而 INT8 派生文件可能有意省略这些原生 inference 不需要的辅助 tensor。如果匹配 BF16 文件仍与所选 INT8/INT8-ConvRot 文件放在同一目录，VDN 会自动读取它的少量 affine tensor/table，不会加载整份 BF16 模型。
+
+如果不保留 BF16 sibling，只需一次性提取约 97 KB 的 companion：
 
 ```bash
-hf download OpenVDN/vdn-minimax-h3 --include "stage-dmd-step-250/*" --local-dir <ComfyUI>/models/vdn
+python tools/extract_h3_adaln_affine.py \
+  <path-to-matching-pruned-bf16.safetensors> \
+  <ComfyUI>/models/vdn/<stage>/adaln_affine.safetensors
 ```
 
-或者使用 8 步 stage 的预量化 **INT8 ConvRot** 版本(输出一致,分支 4.3 -> 2.2 GB,
-加载峰值显存低约 4.7 GB,需要 v1.3.0+):
+源文件含 curve table 时，工具会写入 table identity。若无法建立可信的匹配 affine，VDN 会明确报错，而不是丢掉 Turbo 的 51 个 AdaLN 更新或猜测 basis。
 
-```bash
-hf download drbaph/vdn-minimax-h3-int8-convrot-comfyui --local-dir <ComfyUI>/models/vdn/vdn-minimax-h3-int8-convrot-comfyui
-```
+## VDN branch 权重驻留
 
-文件夹名即为 `vdn_checkpoint` 中的选项。也可以用 `tools/quantize_vdn_branch_int8.py` 自行量化任意 stage。
+### `branch_weights=auto`
 
-8 步模型的 `turbo` 适配器**替代**(而非叠加)社区版 MiniMax-H3 turbo LoRA
-—— 两者不要同时启用。
+吸收 upstream v1.4 的 VRAM-aware 意图，但保持更严格的 ownership。这里使用的是**有效空闲显存**：Comfy 当前报告的 free VRAM 减去传入 base `MODEL` 尚未 resident 的字节数，避免尚未加载的 H3 base 被误当成 VDN 可用空间。
 
-## 官方行为与本移植的差异
+- 普通 BF16 branch 在该有效预算中满足 `1.5 x branch size + 4 GiB` headroom 时使用 `resident`；
+- 否则若存在 `model_int8_convrot_comfyui.safetensors`，选择该文件并使用 `stream`；
+- 否则 stream 普通 branch。
 
-**与官方实现一致**(由 `tests/` 中的单元测试对照参考数学验证):chunk 对齐的
-softmax 窗口与锚点帧(发布规格 `radius=1, chunk=5, anchor_frames=both`)、
-`vdn_solve` delta rule、带 alpha 桥接与文本状态的双向帧扫描、K/V 短卷积、
-输出门控,以及两套 LoRA 适配器。
+INT8 branch 在 auto 模式下仍然 **stream**。这里的 `resident` 必须是真正由 Comfy additional `ModelPatcher` 管理的 parameter tree，不会把量化 branch 偷偷放进未追踪的 VDN GPU cache。
 
-**ComfyUI 特有适配:**
+### `branch_weights=stream`
 
-- 窗口 softmax 默认按 chunk 分组、每组一次稠密 SDPA,而非官方的 block-sparse
-  FlexAttention。分区与数学完全一致;无需 Triton 或 torch.compile。**已内置**
-  FlexAttention + BlockMask 路径(经 `attention_backend: flex` 启用),在
-  triton-windows 上编译运行正常 —— RTX 5090、34.5k tokens 下与 grouped 实测
-  持平(见 Benchmarks.md),故 grouped 仍为默认。官方 FA4 后端更快,但需要
-  Linux + 数据中心级 Blackwell。
-- 官方 Triton/编译融合点(时序卷积、RMSNorm 尾声、gather)默认在此为 eager
-  实现;高级节点的 `fast_kernels` 会把尾声、状态收集与帧主序 q 存储
-  torch.compile 为单内核(数学相同,失败自动回退 eager)。扫描循环的内核
-  启动开销仍是下一个优化目标(torch.compile CUDA graph)。
-- LoRA 通过 ComfyUI 的 bypass/merge 机制应用(int8 融合的 `fc2` 自动走 merge;
-  剪枝基座获得 e-grid adaln 重注入)。
-- 打包序列几何直接读取 ComfyUI 自带的 `PackedLayout`,各条件变体
-  (t2va / fl2va / ref2va)保持可用;VDN 训练只覆盖过 t2va 风格布局。
+- 不常驻完整 branch；
+- 每个 block 需要时才从 stage 解析；
+- `safe_open` 生命周期限制在单次读取内，不保留 process-global mmap；
+- CUDA + retained buffers 时使用 one-block lookahead；全局只有一个有界 worker executor，它不保存模型 tensor cache，每个 VDN state 最多只有一个可取消的 in-flight result；
+- prefetch identity 包含 block index、完整 device 和 compute dtype，因此 placement/dtype 改变后不会复用旧 lookahead 结果。
 
-## 显卡 / 平台
+### `branch_weights=resident`
 
-- **Windows + NVIDIA**:主要目标平台,已测试(RTX 5090,torch 2.10+cu130)。
-- **Linux + NVIDIA**:应可同样工作(纯 PyTorch)。
-- 本移植仅支持单卡。官方 Ulysses 八卡路径未实现(那是并行方式而非算法)。
-- AMD/Intel/CPU:未测试;eager PyTorch 意味着能跑但很慢。delta rule 的
-  Cholesky 需要批量求解后端 —— CPU 可用于小规模测试。
+- 将普通 branch tensor 包装进独立 Comfy `ModelPatcher`；
+- 作为 additional model 由 Comfy 管理 device/load/offload；
+- 不使用私有全局 GPU branch cache。
 
-## 显存与性能
+量化 branch 当前必须使用 `stream`；显式 `resident` 会 fail closed。
 
-显存主要由基座模型决定;VDN 增加约 4.3 GB 分支权重(`stream` 模式下按块流动,
-工作集增量约为一个块的 ~86 MB,外加注意力内部约 `2 x seq_len x 7168 x 2` 字节
-的临时 q/k 副本)。
+最低 residency 组合可使用 `lora_mode=bypass` + `branch_weights=stream`。
 
-RTX 5090 实测(int8 convrot 基座,`stream` 模式,sage2 补丁):1280x736、
-145 帧、8 步、euler/simple、seed 42,约 17 秒/it(采样约 2:15),含音频。
-`grouped` 与 `flex` 注意力后端在 34.5k tokens 下实测持平 —— 该长度下 grouped
-路径每块每步仅约 6 次稠密 SDPA 调用,flex 的融合尚无收益,故 grouped 仍为
-默认。官方报告参考:单张 B200 上稠密 50 步模型 13.95 分钟,优化后的 VDN-H3
-为 5.34 分钟(仅混合架构约 2.6 倍);头条 74.5 倍来自 8xB200 并行 + 8 步蒸馏 +
-fp8 线性层 + FA4/flex 内核的组合。本移植的单卡收益应对标约 2.6 倍的架构性数字,
-具体随窗口所用的注意力后端变化。完整测量数据与验证状态见
-[Benchmarks.md](Benchmarks.md)。
+## Retained runtime buffers
 
-## 故障排查
+Upstream v1.4 证明重复 scratch allocation 有明显成本。本分支保留优化目标，但不采用 process-global CUDA scratch bank。
 
-- **`VDN checkpoint ... not found`** —— stage 目录须位于 `models/vdn/` 下,
-  且包含 `linear_branch/model.safetensors` 与 `model_spec.json`。
-- **"checkpoint has N blocks but the loaded model has M"** —— VDN stage 与
-  加载的基座不匹配(例如 50 块的 stage 用在不同深度的模型上)。请加载匹配的
-  MiniMax-H3 基座。
-- **"This MODEL already has VDN-H3 applied"** —— 该节点只能串接一次。
-- **OOM** —— 用 `branch_weights: stream`(默认)、`lora_mode: merge`、更短的
-  片段或更小的分辨率。**中途取消**:VDN 会在取消时清掉自己的 GPU 缓存,让重跑
-  从干净状态开始;如果是基座模型因显存压力被挤到内存,重跑前手动释放一次
-  (Manager 的 Free、Unload 节点或 `POST /free`)——那部分驻留属于 comfy,不归本节点管。
-- **8 步下动作异常** —— 确认 8 步配 `apply_turbo_adapter` 开,或约 50 步配关;
-  两种步数混用会降低质量。
-- **能出片但像纯模型** —— 打开 `verbose`,在控制台找 `[vdn] layout:`;当片段
-  的潜在帧数 ≤ 15 时窗口已覆盖全部,VDN 会正确地回退到稠密注意力。
+`retain_buffers=on` 可复用：
 
-## 许可证与引用
+- linear complement 的 raw video/text Q/K/V copy；
+- forward/reverse recurrence bank；
+- grouped-window row-index plan；
+- grouped-window K/V gather storage；
+- stream one-block prefetch 状态。
 
-本移植采用 Apache-2.0(见 LICENSE)。VDN-H3 架构、训练与检查点来自
-[OpenVDN](https://github.com/OpenVDN/vdn-minimax-h3)(Apache-2.0);MiniMax-H3
-权重遵循 MiniMax H3 社区许可证。使用 VDN-H3 请引用原作者:
+Ownership：
 
-```bibtex
-@misc{xi2026videodeltanet,
-  title  = {VideoDeltaNet on MiniMax H3},
-  author = {Haocheng Xi and Yiming Xie and Hexu Zhao and Yiwen Zhang and Michael Liu and Thomas Creavin and Kurt Keutzer and Xiuyu Li and Zhaoyang Lv and Chenfeng Xu and Haiwen Feng},
-  year   = {2026},
-  url    = {https://openvdn.github.io/}
-}
-```
+- retained pool 属于单个 `VDNState` / Apply 结果；
+- 只在一次 diffusion-model execution 期间租用；
+- nested/concurrent execution 无法取得同一 lease 时自动使用隔离 transient scratch；
+- 大型 scratch 类别只保留最近 geometry，小型 index plan 另有上限；
+- cancel 会清理该 state 的 retained scratch/prefetch；
+- branch weight 和 LoRA factor 不存放在 scratch pool。
 
+`off` 使用 transient allocation。`auto` 把 `selected branch size + 10 GiB` headroom 规则应用到同一个有效空闲显存预算，也就是先为尚未 resident 的 base `MODEL` 保留空间。
+
+CPU parity test 要求 retained/transient scan、window 和完整 linear-branch 路径与 reference 完全一致；真实 CUDA allocator/速度仍需 GPU 验证。
+
+## 组合与生命周期
+
+VDN 混合注意力本身通过 Comfy object patch 替换 `diffusion_model.blocks.*.attn.forward`。如果其它扩展已经占用同一 attention object-patch 目标，VDN 会明确拒绝冲突。
+
+这与 LoRA runtime 模式不同：`lora_mode=bypass` 不改写 LoRA 目标 `module.forward`，而是使用 weight/bias wrapper。Curve AdaLN 的常数项也通过 bias wrapper，而不是 forward patch。
+
+回归测试覆盖重复 `ModelPatcher` clone/load/unload、pseudo-Continuum `preprocess_text_embeds -> token_refiner.fc1 -> transformer` 顺序、外部 forward owner、不同 strength/config reload、常驻 base weight 不变、无 2x/3x 累积、curve affine constant bias、错误 table 拒绝和文件替换 invalidation。
+
+## Attention backend
+
+- `grouped`：便携默认 exact-window 路径；会把 transformer options 继续传给 Comfy optimized-attention API；
+- `flex`：支持时使用 PyTorch FlexAttention；失败仅对本次调用回退 grouped；process-level BlockMask cache 为最多 8 项的 LRU，并按完整 device/layout identity 区分；
+- full coverage：走 Comfy 普通完整 attention，并关闭不存在的 linear complement。
+
+## Upstream v1.4 对齐
+
+本 PR 开发期间原始 Comfy port 升级到 v1.4.0，加入更快 streaming 和 VRAM-aware retention。本分支吸收其目标，但没有原样复制资源实现。
+
+保留的目标：
+
+- auto branch placement；
+- 内存压力下选择 INT8 ConvRot；
+- one-block stream lookahead；
+- 可复用 scan/window/activation scratch；
+- auto scratch-retention policy。
+
+替换的实现：
+
+- process-global safetensors handle -> 有界 open + file-identity invalidation；
+- private global GPU branch cache -> Comfy-managed resident model 或 stream；
+- global CUDA scan/KV scratch -> 每个 VDN execution 租用的 state-owned scratch；
+- 每 state 永久 worker -> 单一有界、无 tensor cache 的 executor + 每 state 最多一个 in-flight future；
+- 无界且只按 device type 区分的 Flex BlockMask cache -> 最多 8 项、按完整 device/layout identity 区分的 LRU。
+
+因此 upstream v1.4 benchmark 数字不能直接当成本分支性能数据，必须重新做真实 GPU 测试。
+
+## 验证
+
+CI 两个 lane：
+
+1. **Pinned Comfy + official oracle**
+   - ComfyUI `6c53f8c9a06d95f3d847009ceaae55c624169247`
+   - OpenVDN `b8cb28fbfca0266d1c7742a9f25ab8b58191de97`
+   - 直接导入并比较 OpenVDN 数学路径；
+   - 直接实例化并比较发布版 `HybridAttention` orchestration；
+   - adapter、ModelSpec/checkpoint、curve-affine、custom/quantized weight、runtime-buffer、placement policy 和 lifecycle 回归。
+2. **Current Comfy main smoke**
+   - 当前 Comfy `master` 的包导入和节点注册。
+
+扩展后的 pinned suite 为 **110 个测试**，包括 production-shaped KJ selected-INT8 + matching-BF16-sibling affine 解析回归。官方 oracle 覆盖 window/anchor、frame statistics、全部支持的 delta rule、双向 scan、alpha bridge、feature/short-conv、完整 `BidirectionalLinearBranch` 和 reduced `HybridAttention`；其它测试覆盖 fused adapter naming、curve affine 投影及 constant bias、wrong-table rejection、file replacement invalidation、retained/transient parity 和 runtime lifecycle。
+
+绿色 CI 不等于真实渲染质量、峰值 VRAM 或 wall-clock 性能验证。
+
+## 兼容要求
+
+- 当前 ComfyUI MiniMax-H3 fused `qkv_proj` 实现；
+- runtime `bypass` 的 weight 目标需要 Comfy `weight_function`；projected curve AdaLN bias 还需要 `bias_function`；
+- curve/pruned base + full-width released AdaLN adapter 需要与当前 `adaln_t_table` 匹配的 verified `adaln_basis` + `adaln_mean`；
+- 官方 VDN v2 ModelSpec/hybrid-transform contract；
+- stage/base block 数和所有启用 branch tensor shape 必须匹配；
+- malformed/incomplete/unsupported/stale-replaced 资源会提前 fail closed。
+
+## 许可证与来源
+
+**源码：** Apache License 2.0。起源于 Saganaki22 的 ComfyUI-VDN-H3，并移植/改编 OpenVDN 发布的 VDN-H3 架构与算法。见 `LICENSE`、`NOTICE`。
+
+**OpenVDN：** OpenVDN 源码为 Apache-2.0；其 NOTICE 单独说明 VDN-H3 权重是 MiniMax-H3 衍生权重并按 MiniMax-H3 Community License Agreement 分发。
+
+**模型/检查点权重：** 本仓库不会重新授权 MiniMax-H3 或 VDN-H3 权重。下载和使用仍受对应许可证和资格/地域限制。
+
+来源：
+
+- OpenVDN VDN-H3: https://github.com/OpenVDN/vdn-minimax-h3
+- 原始 ComfyUI 移植: https://github.com/Saganaki22/ComfyUI-VDN-H3
+- ComfyUI: https://github.com/Comfy-Org/ComfyUI
+- MiniMax-H3: https://huggingface.co/Comfy-Org/MiniMax-H3
+- VDN-H3 weights: https://huggingface.co/OpenVDN/vdn-minimax-h3

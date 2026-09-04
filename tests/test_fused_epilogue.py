@@ -1,5 +1,10 @@
-"""The compile-fused branch epilogue must equal the eager one (same math, one
-inductor kernel when compilation succeeds; falls back to eager on failure)."""
+"""Numerical contracts for the optional compile-fused branch fast paths.
+
+Inductor can fuse several BF16 pointwise/reduction operations and round once at the
+store where eager PyTorch rounds between operations. The fast path must preserve the
+same algorithm and stay within a small BF16 error budget; bitwise identity is neither
+expected nor claimed.
+"""
 import sys
 from pathlib import Path
 
@@ -11,6 +16,10 @@ from vdn_h3.branch import linear_epilogue
 from vdn_h3 import branch as B
 
 
+BF16_ATOL = 5e-3
+BF16_RTOL = 1e-2
+
+
 def test_epilogue_parity():
     torch.manual_seed(0)
     frames, heads, per_frame, dim = 4, 3, 5, 8
@@ -20,14 +29,18 @@ def test_epilogue_parity():
 
     eager = linear_epilogue(readout, weight, gate, 1e-6, fuse=False)
     fused = linear_epilogue(readout, weight, gate, 1e-6, fuse=True)
-    assert torch.equal(eager.float(), fused.float()), "fused epilogue differs"
+    assert torch.allclose(
+        eager.float(), fused.float(), atol=BF16_ATOL, rtol=BF16_RTOL), (
+        "compiled epilogue exceeded BF16 rounding budget")
     assert eager.shape == (frames * per_frame, heads * dim)
-    print("epilogue fused/eager: PASS (identical)")
 
 
 def test_q_fhsd_store():
-    """fast_kernels stores q frame-major straight out of the activation; layout and
-    values must match the eager view/permute it replaces."""
+    """The frame-major compiled q store replaces eager activation+view+permute.
+
+    Values may differ by roughly one BF16 ulp because Inductor can fuse the
+    normalization/reordering and change where rounding occurs.
+    """
     torch.manual_seed(1)
     frames, per_frame, heads, dim = 4, 5, 3, 8
     x = torch.randn(frames * per_frame, heads, dim).to(torch.bfloat16)
@@ -36,13 +49,16 @@ def test_q_fhsd_store():
     got = B._run_compiled(("test_act_fhsd", True), B._activate_fhsd_body,
                           x, True, frames, per_frame)
     assert got.shape == (frames, heads, per_frame, dim) and got.is_contiguous()
-    assert (got.float() - want.float()).abs().max() < 1e-3
-    print("q fhsd store fused/eager: PASS")
+    assert torch.allclose(
+        got.float(), want.float(), atol=BF16_ATOL, rtol=BF16_RTOL), (
+        "compiled frame-major q store exceeded BF16 rounding budget")
 
 
 def test_readout_parity():
     """End to end: LinearBranch._readout under fast_kernels (fused epilogue + fused
-    gather + frame-major q store) must match the default eager path."""
+    gather + frame-major q store) must match the default eager path at FP32 test
+    precision. This fixture uses FP32 activations, so the tighter budget is expected.
+    """
     torch.manual_seed(2)
     frames, per_frame, heads, dim, hidden = 6, 4, 2, 4, 16
     channels = heads * dim
@@ -66,7 +82,6 @@ def test_readout_parity():
     q_raw = torch.randn(rows, heads, dim)
     k_raw = torch.randn(rows, heads, dim)
     v_raw = torch.randn(rows, heads, dim)
-    bounds = B.window_bounds(frames, 1, 2) if hasattr(B, "window_bounds") else None
     from vdn_h3.window import window_bounds
     bounds = window_bounds(frames, 1, 2)
 
@@ -80,7 +95,6 @@ def test_readout_parity():
                            frame_size=(2, 2))
     err = (fused - eager).abs().max().item()
     assert err < 1e-4, f"fast_kernels readout differs: {err}"
-    print(f"readout fast_kernels/eager: PASS (max err {err:.2e})")
 
 
 if __name__ == "__main__":

@@ -4,7 +4,11 @@ import torch
 
 from vdn_h3 import branch as B
 from vdn_h3 import window as W
-from vdn_h3.retained import run_scans_runtime, window_softmax_grouped_runtime
+from vdn_h3.retained import (
+    RuntimeLinearBranch,
+    run_scans_runtime,
+    window_softmax_grouped_runtime,
+)
 from vdn_h3.runtime import RuntimeBufferOwner, current_runtime_buffers
 
 
@@ -110,3 +114,55 @@ def test_retained_grouped_window_matches_reference_and_reuses_plan_scratch():
 
     assert torch.equal(got, want)
     assert torch.equal(got2, want)
+
+
+def _branch_weights(hidden, heads, dim):
+    return {
+        "beta_proj.weight": torch.randn(heads, hidden) * 0.1,
+        "norm.weight": torch.randn(dim) * 0.1 + 1.0,
+        "alpha.A_log": torch.randn(heads) * 0.1,
+        "alpha.dt_bias": torch.randn(heads * dim) * 0.1,
+        "alpha.down.weight": torch.randn(dim, hidden) * 0.1,
+        "alpha.up.weight": torch.randn(heads * dim, dim) * 0.1,
+        "output_gate.down.weight": torch.randn(dim, hidden) * 0.1,
+        "output_gate.up.weight": torch.randn(heads * dim, dim) * 0.1,
+        "output_gate.up.bias": torch.randn(heads * dim) * 0.1,
+    }
+
+
+def test_complete_runtime_linear_branch_matches_reference_branch():
+    torch.manual_seed(813)
+    frames, per_frame, heads, dim, hidden = 7, 3, 2, 4, 8
+    rows = frames * per_frame
+    text_rows = 5
+    weights = _branch_weights(hidden, heads, dim)
+    xv = torch.randn(rows, hidden)
+    q = torch.randn(rows, heads, dim)
+    k = torch.randn(rows, heads, dim)
+    v = torch.randn(rows, heads, dim)
+    text_x = torch.randn(text_rows, hidden)
+    text_k = torch.randn(text_rows, heads, dim)
+    text_v = torch.randn(text_rows, heads, dim)
+    bounds = W.window_bounds(frames, 1, 3)
+
+    reference = B.LinearBranch(
+        weights, heads, dim, delta_rule="vdn_solve", bridge="alpha",
+        a_fp32=True, short_conv=(), enable_text_state=True)
+    runtime = RuntimeLinearBranch(
+        weights, heads, dim, delta_rule="vdn_solve", bridge="alpha",
+        a_fp32=True, short_conv=(), enable_text_state=True)
+
+    want = reference.readout(
+        weights, xv, q, k, v, frames, per_frame, bounds,
+        frame_size=(1, per_frame), text_x=text_x,
+        text_k_raw=text_k, text_v_raw=text_v, skip_ends=False)
+
+    owner = RuntimeBufferOwner(True)
+    with owner.execution() as resources:
+        got = runtime.readout(
+            weights, xv, q, k, v, frames, per_frame, bounds,
+            frame_size=(1, per_frame), text_x=text_x,
+            text_k_raw=text_k, text_v_raw=text_v, skip_ends=False)
+        assert resources.retained_counts()["scan"] >= 1
+
+    assert torch.equal(got, want)

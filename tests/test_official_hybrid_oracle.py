@@ -53,6 +53,14 @@ def _load_official_hybrid():
     ):
         _pkg(name)
 
+    # OpenVDN's softmax kernels import the diffusers MiniMax rotary helper at module
+    # import time. This CPU oracle never supplies rotary_emb, so install the inert
+    # dependency before loading those kernels rather than depending on diffusers.
+    minimax = types.ModuleType("diffusers.models.transformers.transformer_minimax_h3")
+    minimax._apply_rotary_emb = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("RoPE helper must not run when rotary_emb=None"))
+    sys.modules[minimax.__name__] = minimax
+
     sequence = _load("src.models.sequence_layout", "src/models/sequence_layout.py")
     window = _load("official_hybrid_window", "src/models/softmax_attention/window.py")
     delta = _load("src.models.linear_attention.delta_rule",
@@ -81,9 +89,6 @@ def _load_official_hybrid():
     branch = _load("official_hybrid_branch", "src/models/linear_attention/branch.py")
     linear_pkg.BidirectionalLinearBranch = branch.BidirectionalLinearBranch
 
-    # HybridAttention imports apply_softmax_gate from the softmax package. Wire that
-    # package from the pinned OpenVDN softmax implementation itself; do not substitute
-    # the similarly named linear-attention kernels module.
     softmax_kernels = _load(
         "official_hybrid_softmax_kernels",
         "src/models/softmax_attention/kernels.py",
@@ -97,18 +102,13 @@ def _load_official_hybrid():
     softmax_pkg.window_softmax_flex = lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("FlexAttention must not run in CPU reference oracle"))
 
-    # HybridAttention imports two optional runtime surfaces that this reduced CPU
-    # case deliberately never executes: dense diffusers dispatch (the window is not
-    # full coverage) and rotary embedding (rotary_emb=None).
+    # HybridAttention's full-cover dense dispatch is deliberately unreachable in this
+    # windowed reduced case. Keep it as a fail-fast stub so the oracle cannot silently
+    # switch to a different attention implementation.
     attention_dispatch = types.ModuleType("diffusers.models.attention_dispatch")
     attention_dispatch.dispatch_attention_fn = lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("dense diffusers dispatch must not run in windowed oracle"))
     sys.modules[attention_dispatch.__name__] = attention_dispatch
-
-    minimax = types.ModuleType("diffusers.models.transformers.transformer_minimax_h3")
-    minimax._apply_rotary_emb = lambda *a, **k: (_ for _ in ()).throw(
-        AssertionError("RoPE helper must not run when rotary_emb=None"))
-    sys.modules[minimax.__name__] = minimax
 
     fp8 = types.ModuleType("src.models.ops.fp8_linear")
 

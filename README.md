@@ -63,8 +63,9 @@ The checkpoint/model-weight license is **not** Apache-2.0; see [Licensing and pr
 | `vdn_checkpoint` | Official stage directory under `models/vdn/` |
 | `apply_turbo_adapter` | Apply the stage's released Turbo/DMD adapter when present; enabled for the released 8-step DMD stage |
 | `strength` | Adapter strength; `1.0` is the released setting |
-| `lora_mode` | `merge` or `bypass`; see [LoRA adapter modes](#lora-adapter-modes) |
-| `branch_weights` | `stream` or `resident`; this controls the **VDN linear branch**, not LoRA application |
+| `lora_mode` | `merge` or safe runtime `bypass`; see [LoRA adapter modes](#lora-adapter-modes) |
+| `branch_weights` | `auto`, `stream` or `resident`; controls the **VDN linear branch**, not LoRA application |
+| `retain_buffers` | `auto`, `on` or `off`; controls reusable VDN scratch, not model weights |
 | `attention_backend` | `grouped` portable windowed SDPA, or opt-in `flex` with grouped fallback |
 | `verbose` | Additional VDN layout/adapter logging |
 
@@ -86,11 +87,11 @@ When override mode changes the checkpoint architecture, the node logs the differ
 
 ## LoRA adapter modes
 
-`lora_mode` and `branch_weights` solve different memory problems and are intentionally independent.
+`lora_mode`, `branch_weights` and `retain_buffers` solve different memory problems and are intentionally independent.
 
 ### `lora_mode=merge`
 
-- registers the Stage-B/Turbo adapters through normal `ModelPatcher.add_patches()`;
+- registers Stage-B/Turbo adapters through normal `ModelPatcher.add_patches()`;
 - Comfy owns backup/restore, load/offload, custom-weight conversion and requantization;
 - this remains the reference/eager adapter path and the conservative choice for output validation;
 - on quantized bases, eager dequantize -> patch -> requantize can have a substantial temporary VRAM cost.
@@ -102,25 +103,28 @@ The `bypass` name is preserved for existing workflows, but this is **not the old
 The current runtime mode:
 
 - registers adapter work with Comfy's public `ModelPatcher.add_weight_wrapper()` / `weight_function` lifecycle;
-- never replaces, traverses, splices or restores `module.forward`;
-- never installs a VDN `PatcherInjection` or `_vdn_live_hooks` chain;
+- never replaces, traverses, splices or restores a LoRA target's `module.forward`;
+- never installs a VDN `PatcherInjection`, `_vdn_live_hooks` chain or private forward owner;
 - keeps the resident base parameter unmerged;
-- keeps LoRA A/B factors as low-rank tensors rather than a second resident full-size patched weight;
-- builds only the current layer's transient compute weight and accumulates each `B @ A` contribution into it with in-place `addmm_`, avoiding a second full-size delta tensor;
+- stores LoRA A/B factors in a separate Comfy-managed additional `ModelPatcher` rather than a private GPU cache;
 - aggregates Stage-B and Turbo terms targeting the same weight into one runtime wrapper;
-- is copied/installed/removed by the normal `ModelPatcher` clone and model-load lifecycle.
+- creates only the current layer's transient compute weight;
+- evaluates `B @ A` in bounded output-row chunks, then applies scale and addition in merge-style operation order; the extra delta temporary is capped at 8 MiB instead of another full weight-sized tensor;
+- preserves checkpoint A/B storage dtype and uses Comfy's selected LoRA compute dtype for the invocation;
+- assigns each distinct Apply execution a distinct managed-runtime ownership key so Comfy cannot treat different runtime strengths/configurations as the same loaded weight state even though current `clone_has_same_weights()` does not compare `weight_wrapper_patches` directly;
+- keeps clones of the same Apply result weight-equivalent and under the normal model-load lifecycle.
 
 This restores the low-VRAM adapter option without reintroducing the cross-provider forward-chain recursion that could crash Continuum before chunk 2 reached its first transformer evaluation.
 
 For quantized/fused MiniMax-H3 modules, Comfy's cast path remains authoritative. A runtime weight wrapper can cause a patched INT8 layer to use a dequantized compute fallback for that invocation instead of the fused INT8 kernel. That trades speed for avoiding eager patched-weight materialization; measure it on the actual base and workflow rather than assuming either mode is universally cheaper.
 
-**Output note:** historical VDN bypass measurements used a different forward-hook implementation and showed quality differences on the 8-step DMD stage. They do not establish the numerical behavior of this new weight-wrapper runtime mode. Until matched GPU renders are complete, use `merge` as the reference path for Stage-DMD quality comparisons and treat `bypass` as the low-VRAM path that still requires real-render validation.
+**Output note:** historical VDN bypass measurements used a different activation-level forward-hook implementation and showed quality differences on the 8-step DMD stage. They do not establish the numerical behavior of this weight-level runtime mode. Until matched GPU renders are complete, use `merge` as the Stage-DMD reference path and treat runtime `bypass` as a low-VRAM path requiring real-render validation.
 
 ## Curve/pruned MiniMax-H3 bases
 
 Some MiniMax-H3 checkpoints collapse the dense time embedding into `adaln_t_table`. A full-width learned AdaLN LoRA cannot in general be projected into that smaller curve basis exactly.
 
-This node therefore does **not** drop those adapter weights and does not approximate them. For a curve/pruned base it reconstructs the matching dense time-embedder input and applies the original low-rank AdaLN delta at runtime while leaving the base curve projection intact. This exact AdaLN path is used regardless of whether ordinary adapter targets use `merge` or `bypass`.
+This node therefore does **not** drop those adapter weights and does not approximate them. For a curve/pruned base it reconstructs the matching dense time-embedder input and applies the original low-rank AdaLN delta at runtime while leaving the base curve projection intact. The AdaLN A/B factors use the same Comfy-managed low-rank model as ordinary runtime adapter terms.
 
 To do that exactly, VDN needs the dense time embedder corresponding to the curve base. It resolves either:
 
@@ -141,21 +145,57 @@ If no compatible dense embedder can be established, application fails closed wit
 
 This is separate from `lora_mode`.
 
-`branch_weights=stream`
+### `branch_weights=auto`
+
+The automatic policy incorporates upstream v1.4's VRAM-aware intent while retaining this branch's stronger ownership rules:
+
+- if the ordinary branch fits the upstream `1.5 x branch size + 4 GiB` headroom rule, use `resident` BF16 branch weights;
+- otherwise, if `model_int8_convrot_comfyui.safetensors` exists, select it and use `stream`;
+- otherwise stream the ordinary branch.
+
+The INT8 branch deliberately remains streamed under auto mode. `resident` means a real Comfy-managed parameter tree here; quantized branch tensors are not silently copied into an untracked VDN GPU cache.
+
+### `branch_weights=stream`
 
 - does not keep the complete VDN linear branch resident as an additional model;
-- resolves each block from the stage file when needed;
-- keeps safetensors mappings bounded to each load operation rather than retaining process-global mmap handles.
+- resolves each block from the selected stage file with a bounded `safe_open` lifetime;
+- never keeps a process-global safetensors mmap handle;
+- when retained runtime buffers are enabled on CUDA, uses one-block lookahead transfer through one bounded worker executor; the executor owns no model tensor cache and each VDN state owns at most one cancellable in-flight result.
 
-`branch_weights=resident`
+### `branch_weights=resident`
 
-- wraps the branch tensors in a separate Comfy-managed `ModelPatcher`;
+- wraps ordinary branch tensors in a separate Comfy-managed `ModelPatcher`;
 - registers it as an additional model so Comfy owns device placement and load/offload lifecycle;
 - avoids the old untracked process-global GPU branch cache.
 
-Quantized VDN branch files currently require `stream`; resident mode fails closed rather than silently dequantizing them.
+Quantized VDN branch files currently require `stream`; explicit resident mode fails closed rather than silently dequantizing them.
 
-A low-memory setup can therefore combine `lora_mode=bypass` with `branch_weights=stream`: the first controls adapter materialization, while the second controls VDN linear-branch residency.
+A minimum-residency setup can combine `lora_mode=bypass` with `branch_weights=stream`: the first controls adapter materialization, while the second controls VDN linear-branch residency.
+
+## Retained runtime buffers
+
+Upstream v1.4 demonstrated that repeated scratch allocation can cost meaningful time. This branch incorporates that optimization without adopting process-global GPU scratch banks.
+
+`retain_buffers=on` reuses state-owned scratch for:
+
+- raw video/text Q/K/V copies used by the linear complement;
+- forward/reverse recurrence banks;
+- grouped-window row-index plans;
+- grouped-window K/V gather storage;
+- the one-block stream prefetch state.
+
+Ownership rules are explicit:
+
+- one retained pool belongs to one `VDNState` / Apply result;
+- the pool is leased for the duration of a diffusion-model execution;
+- nested or concurrent executions that cannot acquire that lease receive isolated transient scratch instead of racing the retained tensors;
+- large retained categories keep only the most recent geometry; small index plans are bounded separately;
+- cancellation clears that state's retained scratch/prefetch state;
+- branch weights and LoRA factors are **not** stored in this scratch pool.
+
+`retain_buffers=off` uses transient allocation behavior. `auto` enables retention only when free VRAM satisfies the selected branch size + 10 GiB headroom rule inherited from upstream v1.4.
+
+CPU tests require retained and transient scan/window/complete-linear-branch paths to match the reference path exactly. Real CUDA allocation and speed still require production GPU validation.
 
 ## Composition and lifecycle
 
@@ -171,17 +211,39 @@ The test suite includes repeated `ModelPatcher` clone/load/unload cycles and a p
 - one aggregate runtime wrapper per target weight;
 - stable output across repeated clones;
 - no 2x/3x adapter accumulation;
-- independent strength changes from the true base.
+- independent strength changes from the true base;
+- different Apply configurations to be non-equivalent to Comfy model management while clones of one Apply remain equivalent.
 
 That is structural CPU coverage; it is not a substitute for a real GPU Continuum render or VRAM measurement.
 
 ## Attention backends
 
-- `grouped` is the portable default. Frames sharing the same VDN window are evaluated as grouped dense SDPA calls.
+- `grouped` is the portable default. Frames sharing the same VDN window are evaluated as grouped dense SDPA calls. Transformer options are forwarded to Comfy's optimized-attention call so normal Comfy composition remains available.
 - `flex` uses PyTorch FlexAttention when available and suitable. Failure falls back to grouped execution for that call without mutating shared VDN state.
 - full-coverage windows use ComfyUI's normal optimized dense-attention path and disable the linear complement because nothing lies outside the softmax window.
 
-See [Benchmarks.md](Benchmarks.md) for historical measurements. Those measurements predate this lifecycle/runtime-adapter refactor unless explicitly marked otherwise and must not be treated as performance validation of the current branch.
+See [Benchmarks.md](Benchmarks.md) for historical measurements. Measurements that predate this lifecycle/runtime refactor are not performance validation of the current branch.
+
+## Upstream v1.4 reconciliation
+
+During this correctness PR, the original Comfy port advanced to v1.4.0 with faster streaming and VRAM-aware buffer retention. Those goals are incorporated here, but not by copying its resource implementation verbatim.
+
+Retained from v1.4's intent:
+
+- automatic branch placement;
+- optional INT8 ConvRot branch selection under pressure;
+- one-block stream lookahead;
+- reusable scan/window/activation scratch;
+- automatic scratch-retention headroom policy.
+
+Deliberately replaced in this branch:
+
+- persistent process-global safetensors handles -> bounded file opens with file-identity invalidation;
+- private process-global GPU branch cache -> Comfy-managed resident branch model or streaming;
+- process-global CUDA scan/KV scratch -> per-VDN execution-leased scratch;
+- per-state immortal prefetch worker -> one bounded tensor-less executor plus at most one state-owned in-flight future.
+
+This means upstream v1.4 benchmark numbers cannot simply be assigned to this implementation. The optimized lifecycle needs its own real GPU measurements.
 
 ## Validation
 
@@ -191,11 +253,12 @@ The repository CI has two distinct lanes:
    - ComfyUI `6c53f8c9a06d95f3d847009ceaae55c624169247`;
    - OpenVDN `b8cb28fbfca0266d1c7742a9f25ab8b58191de97`;
    - direct reduced-dimension CPU comparisons against imported OpenVDN source;
-   - independent math, adapter conversion, ModelSpec/checkpoint, curve, quantized/custom-weight and lifecycle regressions.
+   - direct instantiation/comparison of the released OpenVDN `HybridAttention` orchestration;
+   - adapter conversion, ModelSpec/checkpoint, curve, quantized/custom-weight, runtime-buffer, placement-policy and lifecycle regressions.
 2. **Current Comfy main smoke**
    - checks current Comfy `master` for package import and node registration against the latest API surface.
 
-The direct oracle covers window bounds/anchors, frame statistics, all supported delta rules, forward/reverse scans, alpha bridge, feature preparation/short-conv behavior and the complete `BidirectionalLinearBranch` under reduced CPU dimensions.
+The official oracle covers window bounds/anchors, frame statistics, all supported delta rules, forward/reverse scans, alpha bridge, feature preparation/short-conv behavior, the complete `BidirectionalLinearBranch`, and the complete reduced `HybridAttention` local-softmax + recurrent-linear orchestration. Separate parity tests cover retained vs transient recurrence/window/complete-linear-branch execution.
 
 No large checkpoint or GPU render is run in CI. A green synthetic/oracle suite establishes implementation and lifecycle contracts; it does not establish real-render quality, peak VRAM or wall-clock performance.
 
@@ -225,4 +288,4 @@ Upstream/research sources:
 
 ## Historical media
 
-Existing upstream example media and performance measurements are intentionally treated as historical evidence rather than revalidation of the refactored lifecycle path. The latest upstream Ref2V example is 928x928; see the original repository for its current media assets and presentation.
+Existing upstream example media and historical performance measurements are evidence for their specific revisions, not revalidation of this refactored lifecycle path. The latest upstream Ref2V example is 928x928; see the original repository for its current media assets and presentation.

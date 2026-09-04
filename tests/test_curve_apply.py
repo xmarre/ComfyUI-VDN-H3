@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from safetensors.torch import save_file
 
 import comfy.model_patcher
@@ -12,7 +13,7 @@ from vdn_h3.apply import apply_adapters
 class MarkedLinear(nn.Linear):
     def __init__(self, in_features, out_features):
         super().__init__(in_features, out_features, bias=True)
-        # Current Comfy castable Linear modules expose these lists.  Runtime VDN
+        # Current Comfy castable Linear modules expose these lists. Runtime VDN
         # targets them through ModelPatcher.add_weight_wrapper; module.forward stays
         # untouched.
         self.weight_function = []
@@ -144,3 +145,39 @@ def test_curve_bypass_managed_model_owns_projected_bias_offset(tmp_path):
     assert managed.term_count() == 1
     assert managed.bias_term_count() == 1
     assert any(p.dtype == torch.float32 and p.numel() == out for p in managed.parameters())
+
+
+def test_curve_bypass_weight_plus_bias_wrapper_matches_affine_dense_delta(tmp_path):
+    torch.manual_seed(424)
+    table = torch.randn(9, 3)
+    dense, rank, out = 7, 2, 6
+    basis = torch.randn(3, dense)
+    mean = torch.randn(dense)
+    stage = _stage(tmp_path, basis, mean)
+    patcher = _patcher(table, out)
+    linear = patcher.get_model_object("diffusion_model.blocks.0.adaln_proj.linear")
+    base_weight = linear.weight.detach().clone()
+    base_bias = linear.bias.detach().clone()
+    a = torch.randn(rank, dense)
+    b = torch.randn(out, rank)
+    strength = 0.625
+
+    apply_adapters(
+        patcher,
+        {"turbo": {"blocks.0.adaln_proj.linear": (a, b, 1.0)}},
+        strength,
+        mode="bypass",
+        stage_path=str(stage),
+    )
+    weight_key = "diffusion_model.blocks.0.adaln_proj.linear.weight"
+    bias_key = "diffusion_model.blocks.0.adaln_proj.linear.bias"
+    wrapped_weight = patcher.weight_wrapper_patches[weight_key][0](base_weight)
+    wrapped_bias = patcher.weight_wrapper_patches[bias_key][0](base_bias)
+
+    coords = torch.randn(5, 3)
+    got = F.linear(coords, wrapped_weight, wrapped_bias)
+    dense_input = mean + coords @ basis
+    expected = F.linear(coords, base_weight, base_bias) + F.linear(
+        F.linear(dense_input, a), b) * strength
+
+    assert torch.allclose(got, expected, atol=2e-5, rtol=2e-5)

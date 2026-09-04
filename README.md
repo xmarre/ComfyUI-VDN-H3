@@ -104,15 +104,14 @@ The current runtime mode:
 
 - registers adapter work with Comfy's public `ModelPatcher.add_weight_wrapper()` / `weight_function` lifecycle;
 - never replaces, traverses, splices or restores a LoRA target's `module.forward`;
-- never installs a VDN `PatcherInjection`, `_vdn_live_hooks` chain or private forward owner;
+- never installs a VDN LoRA `PatcherInjection`, `_vdn_live_hooks` chain or private forward owner;
 - keeps the resident base parameter unmerged;
-- stores LoRA A/B factors in a separate Comfy-managed additional `ModelPatcher` rather than a private GPU cache;
-- aggregates Stage-B and Turbo terms targeting the same weight into one runtime wrapper;
+- stores LoRA factors in a separate Comfy-managed additional `ModelPatcher` rather than a private GPU cache;
+- aggregates Stage-B/Turbo terms targeting the same base weight into one runtime wrapper;
 - creates only the current layer's transient compute weight;
-- evaluates `B @ A` in bounded output-row chunks, then applies scale and addition in merge-style operation order; the extra delta temporary is capped at 8 MiB instead of another full weight-sized tensor;
-- preserves checkpoint A/B storage dtype and uses Comfy's selected LoRA compute dtype for the invocation;
-- assigns each distinct Apply execution a distinct managed-runtime ownership key so Comfy cannot treat different runtime strengths/configurations as the same loaded weight state even though current `clone_has_same_weights()` does not compare `weight_wrapper_patches` directly;
-- keeps clones of the same Apply result weight-equivalent and under the normal model-load lifecycle.
+- evaluates `B @ A` in bounded output-row chunks, then applies scale and addition in merge-style operation order; the extra delta temporary is capped at 8 MiB rather than another full weight-sized tensor;
+- preserves checkpoint factor storage dtype and uses Comfy's selected LoRA compute dtype for the invocation;
+- assigns each distinct Apply execution a distinct managed-runtime ownership key, while clones of the same Apply result remain weight-equivalent.
 
 This restores the low-VRAM adapter option without reintroducing the cross-provider forward-chain recursion that could crash Continuum before chunk 2 reached its first transformer evaluation.
 
@@ -122,24 +121,51 @@ For quantized/fused MiniMax-H3 modules, Comfy's cast path remains authoritative.
 
 ## Curve/pruned MiniMax-H3 bases
 
-Some MiniMax-H3 checkpoints collapse the dense time embedding into `adaln_t_table`. A full-width learned AdaLN LoRA cannot in general be projected into that smaller curve basis exactly.
+Some MiniMax-H3 checkpoints collapse the dense AdaLN timestep representation to a small coordinate table such as `adaln_t_table`. The supported pruned lineage is constructed with an affine approximation
 
-This node therefore does **not** drop those adapter weights and does not approximate them. For a curve/pruned base it reconstructs the matching dense time-embedder input and applies the original low-rank AdaLN delta at runtime while leaving the base curve projection intact. The AdaLN A/B factors use the same Comfy-managed low-rank model as ordinary runtime adapter terms.
-
-To do that exactly, VDN needs the dense time embedder corresponding to the curve base. It resolves either:
-
-1. `dense_time_embedder.safetensors` placed directly in the VDN stage directory; or
-2. a matching installed dense MiniMax-H3 checkpoint under `models/diffusion_models`.
-
-You can extract the small companion from a matching dense H3 checkpoint:
-
-```bash
-python tools/extract_h3_time_embedder.py \
-  <path-to-dense-h3.safetensors> \
-  <ComfyUI>/models/vdn/<stage>/dense_time_embedder.safetensors
+```text
+dense(t) ≈ mean + curve(t) @ basis
 ```
 
-If no compatible dense embedder can be established, application fails closed with an actionable error. It never silently omits learned AdaLN adapter parameters.
+The released VDN Turbo adapter contains full-width learned AdaLN LoRAs. For one such update `B @ A`, VDN projects it once onto the native pruned coordinates as
+
+```text
+A_pruned   = A @ basis.T
+bias_delta = B @ (A @ mean)
+```
+
+Both terms are required. The constant `bias_delta` is not optional and is never silently dropped.
+
+The projection is performed once in float64 from the stored adapter and pruning-affine tensors. The projected A matrix and constant bias offset are stored as float32, while B retains its checkpoint storage dtype until Comfy selects the invocation compute dtype. This introduces **no additional model approximation beyond the pruned base's existing affine approximation**; it does not claim bitwise equivalence to the original unpruned dense timestep MLP.
+
+Runtime behavior stays native to the pruned model:
+
+- there is no reconstructed dense timestep MLP in the sampling loop;
+- there is no AdaLN `forward` object patch;
+- `merge` registers the projected low-rank weight term and constant bias as normal Comfy patches;
+- `bypass` stores projected A/B plus the float32 bias offset in the same Comfy-managed additional model and applies them through Comfy weight/bias wrappers.
+
+### Resolving the pruning affine
+
+VDN must use the exact `adaln_basis` + `adaln_mean` pair corresponding to the loaded `adaln_t_table`; an unrelated basis is not interchangeable. Resolution is fail-closed and follows this order:
+
+1. `adaln_affine.safetensors` in the selected VDN stage directory;
+2. the selected diffusion-model checkpoint and sibling `.safetensors` files;
+3. other installed `models/diffusion_models` candidates.
+
+Installed checkpoint candidates must prove that their curve table matches the loaded base. A mismatched or unverified affine is rejected.
+
+For the repaired pruned MiniMax-H3 Comfy lineage, the BF16 source checkpoint can retain `adaln_basis` and `adaln_mean`, while INT8 derivatives may intentionally omit those inference-unused auxiliaries. If the matching BF16 file is still beside the selected INT8/INT8-ConvRot file, VDN can resolve the affine automatically and reads only the tiny affine tensors/table from that file; it does not load the full BF16 model.
+
+If you do not keep the BF16 sibling, extract the approximately 97 KB companion once:
+
+```bash
+python tools/extract_h3_adaln_affine.py \
+  <path-to-matching-pruned-bf16.safetensors> \
+  <ComfyUI>/models/vdn/<stage>/adaln_affine.safetensors
+```
+
+The extractor records a curve-table identity when the source contains the table. If no verified affine can be established, VDN fails with an actionable error rather than dropping the 51 released Turbo AdaLN updates or guessing a basis.
 
 ## VDN branch-weight residency
 
@@ -202,7 +228,7 @@ CPU tests require retained and transient scan/window/complete-linear-branch path
 
 VDN replaces `diffusion_model.blocks.*.attn.forward` for the **VDN hybrid-attention transform** through a Comfy object patch. Another extension that owns that exact attention object-patch target is incompatible; VDN refuses an existing conflicting owner rather than stacking ambiguous attention replacements.
 
-That attention ownership is distinct from LoRA runtime mode. `lora_mode=bypass` does **not** patch any LoRA target's `module.forward`; it uses weight wrappers instead. Ordinary model weight patches/LoRAs remain under Comfy's weight lifecycle and are not traversed or reordered by VDN.
+That attention ownership is distinct from LoRA runtime mode. `lora_mode=bypass` does **not** patch any LoRA target's `module.forward`; it uses weight/bias wrappers instead. Ordinary model weight patches/LoRAs remain under Comfy's weight lifecycle and are not traversed or reordered by VDN.
 
 The test suite includes repeated `ModelPatcher` clone/load/unload cycles and a pseudo-Continuum sequence that executes the conditioning path (`preprocess_text_embeds -> token_refiner.fc1`) before a transformer evaluation on every chunk. Runtime-mode regressions additionally require:
 
@@ -210,6 +236,7 @@ The test suite includes repeated `ModelPatcher` clone/load/unload cycles and a p
 - unchanged `module.forward` ownership;
 - unchanged resident base weights;
 - one aggregate runtime wrapper per target weight;
+- projected curve AdaLN constant terms applied through bias wrappers rather than a forward patch;
 - stable output across repeated clones;
 - no 2x/3x adapter accumulation;
 - independent strength changes from the true base;
@@ -256,18 +283,19 @@ The repository CI has two distinct lanes:
    - OpenVDN `b8cb28fbfca0266d1c7742a9f25ab8b58191de97`;
    - direct reduced-dimension CPU comparisons against imported OpenVDN source;
    - direct instantiation/comparison of the released OpenVDN `HybridAttention` orchestration;
-   - adapter conversion, ModelSpec/checkpoint, curve, quantized/custom-weight, runtime-buffer, placement-policy and lifecycle regressions.
+   - adapter conversion, ModelSpec/checkpoint, curve-affine, quantized/custom-weight, runtime-buffer, placement-policy and lifecycle regressions.
 2. **Current Comfy main smoke**
    - checks current Comfy `master` for package import and node registration against the latest API surface.
 
-The current expanded pinned suite contains **97 passing tests**. The official oracle covers window bounds/anchors, frame statistics, all supported delta rules, forward/reverse scans, alpha bridge, feature preparation/short-conv behavior, the complete `BidirectionalLinearBranch`, and the complete reduced `HybridAttention` local-softmax + recurrent-linear orchestration. Separate parity tests cover retained vs transient recurrence/window/complete-linear-branch execution, base-residency-aware placement policy, prefetch placement identity and bounded Flex cache behavior.
+The expanded pinned suite contains **110 tests** after the production-shaped KJ selected-INT8 + matching-BF16-sibling affine resolver regression. The official oracle covers window bounds/anchors, frame statistics, all supported delta rules, forward/reverse scans, alpha bridge, feature preparation/short-conv behavior, the complete `BidirectionalLinearBranch`, and the complete reduced `HybridAttention` local-softmax + recurrent-linear orchestration. Separate parity/lifecycle tests cover retained vs transient execution, base-residency-aware placement, prefetch identity, bounded Flex cache, fused adapter naming, curve affine projection including constant bias, wrong-table rejection and file replacement invalidation.
 
 No large checkpoint or GPU render is run in CI. A green synthetic/oracle suite establishes implementation and lifecycle contracts; it does not establish real-render quality, peak VRAM or wall-clock performance.
 
 ## Compatibility requirements
 
-- current ComfyUI MiniMax-H3 implementation with `diffusion_model.blocks[].attn.qkv_proj`;
-- runtime `bypass` additionally requires the target Comfy module to expose the supported `weight_function` contract; unsupported module implementations fail closed and can use `merge`;
+- current ComfyUI MiniMax-H3 implementation with fused `diffusion_model.blocks[].attn.qkv_proj`;
+- runtime `bypass` additionally requires target Comfy modules to expose the supported `weight_function` contract; projected curve AdaLN bias targets also require `bias_function`;
+- curve/pruned bases with full-width released AdaLN adapters require the verified pruning affine (`adaln_basis` + `adaln_mean`) matching the loaded `adaln_t_table`;
 - the official VDN v2 ModelSpec/hybrid-transform contract;
 - stage/base block count and every enabled trained branch tensor shape must match;
 - malformed, incomplete, unsupported or stale-replaced checkpoint resources fail early.

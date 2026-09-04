@@ -60,16 +60,17 @@ def make_managed_branch_patcher(branches, base_patcher):
 class RuntimeLoRATermsModel(nn.Module):
     """Low-rank runtime adapter tensors owned by an additional ModelPatcher.
 
-    The model contains only A/B factors, never a full patched H3 weight. Keeping them
-    as Parameters lets normal Comfy model loading decide whether those small tensors
-    stay on the compute device or are offloaded. Runtime weight wrappers are stateless
-    references into this model, so they do not carry a private GPU cache across clones.
+    The model contains A/B factors and, for projected pruned-AdaLN adapters, tiny
+    float32 constant bias offsets. Keeping them as Parameters lets normal Comfy model
+    loading own residency/offload. Runtime wrappers are stateless references into
+    this model, so they carry no private GPU cache across clones.
     """
 
-    def __init__(self, terms_by_module, offload_device):
+    def __init__(self, terms_by_module, offload_device, bias_terms_by_module=None):
         super().__init__()
         self.values = nn.ParameterList()
         self._terms = {}
+        self._bias_terms = {}
         self.device = offload_device
 
         for module in sorted(terms_by_module):
@@ -84,6 +85,17 @@ class RuntimeLoRATermsModel(nn.Module):
                 refs.append((ai, bi, float(scale)))
             self._terms[module] = tuple(refs)
 
+        for module in sorted(bias_terms_by_module or {}):
+            refs = []
+            for offset, scale in bias_terms_by_module[module]:
+                if not isinstance(offset, torch.Tensor) or offset.ndim != 1:
+                    raise TypeError(f"runtime bias offset {module} must be a 1-D torch tensor")
+                oi = len(self.values)
+                self.values.append(nn.Parameter(
+                    offset.detach().to(torch.float32).contiguous(), requires_grad=False))
+                refs.append((oi, float(scale)))
+            self._bias_terms[module] = tuple(refs)
+
     def terms_on(self, module, device, dtype):
         refs = self._terms[module]
         return tuple(
@@ -97,13 +109,30 @@ class RuntimeLoRATermsModel(nn.Module):
             for ai, bi, scale in refs
         )
 
+    def bias_terms_on(self, module, device, dtype):
+        refs = self._bias_terms[module]
+        return tuple(
+            (
+                comfy.model_management.cast_to(
+                    self.values[oi], device=device, dtype=dtype, copy=False),
+                scale,
+            )
+            for oi, scale in refs
+        )
+
     def term_count(self):
         return sum(len(refs) for refs in self._terms.values())
 
+    def bias_term_count(self):
+        return sum(len(refs) for refs in self._bias_terms.values())
 
-def make_managed_runtime_lora_patcher(terms_by_module, base_patcher):
-    """Build Comfy-owned storage for runtime-low-VRAM LoRA A/B factors."""
-    model = RuntimeLoRATermsModel(terms_by_module, base_patcher.offload_device)
+
+def make_managed_runtime_lora_patcher(
+        terms_by_module, base_patcher, bias_terms_by_module=None):
+    """Build Comfy-owned storage for runtime LoRA factors and projected bias offsets."""
+    model = RuntimeLoRATermsModel(
+        terms_by_module, base_patcher.offload_device,
+        bias_terms_by_module=bias_terms_by_module)
     patcher = comfy.model_patcher.ModelPatcher(
         model,
         load_device=base_patcher.load_device,

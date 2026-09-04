@@ -30,7 +30,9 @@ def test_qkv_fusion_preserves_individual_delta_matrices():
     got = (b.float() @ a.float()) * scale
     want = torch.cat(individual, dim=0)
     assert got.shape == want.shape
-    assert torch.equal(got, want)
+    # Block-diagonal GEMM is mathematically exact but may choose a different FP32
+    # reduction schedule than three separate GEMMs.
+    assert torch.allclose(got, want, atol=2e-6, rtol=2e-6)
 
 
 def test_qkv_fusion_preserves_common_alpha_scale():
@@ -48,7 +50,12 @@ def test_qkv_fusion_preserves_common_alpha_scale():
     converted = convert_adapter(state, {"rank": rank, "alpha": 1})
     a, b, scale = converted["blocks.0.attn.qkv_proj"]
     assert scale == 0.5
-    assert torch.equal((b.float() @ a.float()) * scale, torch.cat(individual, dim=0))
+    assert torch.allclose(
+        (b.float() @ a.float()) * scale,
+        torch.cat(individual, dim=0),
+        atol=2e-6,
+        rtol=2e-6,
+    )
 
 
 def test_incomplete_qkv_triplet_fails_closed():
@@ -61,20 +68,37 @@ def test_incomplete_qkv_triplet_fails_closed():
         convert_adapter(state, {"rank": 2, "alpha": 2})
 
 
-def test_mixed_qkv_rank_fails_before_model_patching():
+def test_mixed_qkv_rank_and_scale_are_preserved_exactly():
+    torch.manual_seed(420)
+    inp, out = 4, 3
+    ranks = (2, 3, 4)
+    suffixes = ("to_q", "to_k", "to_v")
     state = {}
-    for rank, suffix in zip((2, 3, 2), ("to_q", "to_k", "to_v")):
-        state.update(_pair(
-            f"transformer_blocks.0.attn.orig.{suffix}",
-            torch.randn(rank, 4), torch.randn(3, rank)))
+    want = []
+    for rank, suffix in zip(ranks, suffixes):
+        module = f"transformer_blocks.0.attn.orig.{suffix}"
+        a = torch.randn(rank, inp)
+        b = torch.randn(out, rank)
+        state.update(_pair(module, a, b))
+        scale = {"to_q": 0.5, "to_k": 2.0 / 3.0, "to_v": 1.25}[suffix]
+        want.append((b.float() @ a.float()) * scale)
+
     config = {
         "rank": 2,
-        "alpha": 2,
-        "rank_pattern": {"to_k": 3},
-        "alpha_pattern": {"to_k": 3},
+        "alpha": 1,
+        "rank_pattern": {"to_k": 3, "to_v": 4},
+        "alpha_pattern": {"to_k": 2, "to_v": 5},
     }
-    with pytest.raises(ValueError, match="mixed LoRA ranks"):
-        convert_adapter(state, config)
+    a, b, scale = convert_adapter(state, config)["blocks.0.attn.qkv_proj"]
+    assert a.shape == (sum(ranks), inp)
+    assert b.shape == (3 * out, sum(ranks))
+    assert scale == 1.0
+    assert torch.allclose(
+        (b.float() @ a.float()) * scale,
+        torch.cat(want, dim=0),
+        atol=2e-6,
+        rtol=2e-6,
+    )
 
 
 def test_swiglu_b_half_swap_matches_comfy_gate_value_order():
@@ -90,34 +114,29 @@ def test_swiglu_b_half_swap_matches_comfy_gate_value_order():
     assert scale == 1.0
 
 
-def test_turbo_block_adaln_maps_without_projection_or_shape_change():
-    torch.manual_seed(44)
-    a = torch.randn(4, 12)
-    b = torch.randn(18, 4)
-    module = "transformer_blocks.7.adaln_proj.linear"
-    converted = convert_adapter(_pair(module, a, b), {"rank": 4, "alpha": 2})
-    got_a, got_b, scale = converted["blocks.7.adaln_proj.linear"]
-    assert torch.equal(got_a, a.float())
-    assert torch.equal(got_b, b.float())
-    assert scale == 0.5
-
-
-def test_turbo_final_adaln_maps_to_comfy_final_layer_exactly():
-    torch.manual_seed(45)
-    a = torch.randn(3, 10)
-    b = torch.randn(15, 3)
-    converted = convert_adapter(
-        _pair("norm_out.linear", a, b), {"rank": 3, "alpha": 3})
-    assert set(converted) == {"final_layer.adaln_proj.linear"}
-    got_a, got_b, scale = converted["final_layer.adaln_proj.linear"]
-    assert torch.equal(got_a, a.float())
-    assert torch.equal(got_b, b.float())
-    assert scale == 1.0
-
-
 def test_missing_lora_side_fails_with_context():
     state = {
         "transformer_blocks.0.attn.orig.to_out.0.lora_A.weight": torch.randn(2, 4),
     }
     with pytest.raises(ValueError, match="exactly A and B"):
         convert_adapter(state, {"rank": 2, "alpha": 2})
+
+
+def test_turbo_block_and_final_adaln_targets_map_independently():
+    torch.manual_seed(44)
+    a = torch.randn(2, 8)
+    block_b = torch.randn(12, 2)
+    final_b = torch.randn(6, 2)
+    state = {}
+    state.update(_pair("transformer_blocks.3.adaln_proj.linear", a, block_b))
+    state.update(_pair("norm_out.linear", a, final_b))
+
+    converted = convert_adapter(state, {"rank": 2, "alpha": 2})
+    assert set(converted) == {
+        "blocks.3.adaln_proj.linear",
+        "final_layer.adaln_proj.linear",
+    }
+    assert torch.equal(converted["blocks.3.adaln_proj.linear"][0], a.float())
+    assert torch.equal(converted["blocks.3.adaln_proj.linear"][1], block_b.float())
+    assert torch.equal(converted["final_layer.adaln_proj.linear"][0], a.float())
+    assert torch.equal(converted["final_layer.adaln_proj.linear"][1], final_b.float())

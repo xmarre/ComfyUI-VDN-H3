@@ -112,7 +112,7 @@ def _install_curve_adaln(new_model, dm, stage_path, terms_by_module):
         raise RuntimeError(
             "MiniMax-H3 adaln_t_table is still on the meta device; load the base "
             "checkpoint before applying VDN")
-    table_cpu = table.detach().to(torch.float32, device="cpu").clone()
+    table_cpu = table.detach().to(device="cpu", dtype=torch.float32).clone()
     embedder, residual = find_dense_time_embedder(stage_path, table_cpu)
     _log.info("[vdn] curve AdaLN source: %s (base-curve residual %.3e)",
               embedder.source, residual)

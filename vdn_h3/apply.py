@@ -13,6 +13,7 @@ Full-width AdaLN LoRAs on a curve/pruned H3 base are reconstructed at runtime by
 from __future__ import annotations
 
 import logging
+import uuid
 
 import torch
 
@@ -32,6 +33,7 @@ from vdn_h3.managed import make_managed_runtime_lora_patcher
 
 _log = logging.getLogger("comfy.vdn")
 _RUNTIME_DELTA_BUFFER_BYTES = 8 << 20
+_RUNTIME_MODEL_KEY_PREFIX = "vdn_runtime_lora_"
 
 
 def _is_adaln(module: str) -> bool:
@@ -279,10 +281,18 @@ def apply_adapters(new_model, converted_by_name, strength, mode="merge",
     managed_terms = _merge_runtime_terms(runtime_terms, curve_terms)
     managed = None
     managed_bytes = 0
+    runtime_owner_key = None
     if managed_terms:
         managed, managed_patcher = make_managed_runtime_lora_patcher(
             managed_terms, new_model)
-        new_model.set_additional_models("vdn_runtime_lora", [managed_patcher])
+        # Core currently does not compare weight_wrapper_patches in
+        # ModelPatcher.clone_has_same_weights(), and it returns early when both
+        # patchers have no ordinary weight patches. Give every Apply execution a
+        # distinct additional-model key so changing strength/options cannot reuse a
+        # still-loaded wrapper set from an older clone. Clones of *this* result keep
+        # the same key and remain equivalent.
+        runtime_owner_key = _RUNTIME_MODEL_KEY_PREFIX + uuid.uuid4().hex
+        new_model.set_additional_models(runtime_owner_key, [managed_patcher])
         managed_bytes = sum(
             p.numel() * p.element_size() for p in managed.parameters())
 
@@ -294,6 +304,7 @@ def apply_adapters(new_model, converted_by_name, strength, mode="merge",
             "forward_hooks": 0,
             "managed_adapter_bytes": managed_bytes,
             "delta_buffer_limit_bytes": _RUNTIME_DELTA_BUFFER_BYTES,
+            "owner_key": runtime_owner_key,
         }
 
     curve_source = _install_curve_adaln(
@@ -303,5 +314,6 @@ def apply_adapters(new_model, converted_by_name, strength, mode="merge",
             "source": curve_source[0],
             "residual": curve_source[1],
             "managed_adapter_bytes": managed_bytes,
+            "owner_key": runtime_owner_key,
         }
     return report

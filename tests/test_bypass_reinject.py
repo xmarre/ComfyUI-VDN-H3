@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import comfy.model_patcher
 import comfy.ops
@@ -104,6 +105,7 @@ def _patched_from(base, strength=1.0, seed=20, mode="merge"):
         assert runtime["forward_hooks"] == 0
         assert runtime["managed_adapter_bytes"] > 0
         assert runtime["delta_buffer_limit_bytes"] > 0
+        assert runtime["owner_key"].startswith("vdn_runtime_lora_")
     return patcher
 
 
@@ -145,7 +147,8 @@ def test_runtime_mode_registers_weight_wrapper_not_injection_or_forward_patch():
     assert len(wrappers) == 1
     assert wrappers[0]._vdn_runtime_lora is True
     assert wrappers[0].source.term_count() == 1
-    assert "vdn_runtime_lora" in vdn.additional_models
+    runtime_keys = [k for k in vdn.additional_models if k.startswith("vdn_runtime_lora_")]
+    assert len(runtime_keys) == 1
     assert module.forward.__func__ is original_forward
 
 
@@ -256,20 +259,38 @@ def test_runtime_strength_change_reapplies_from_true_base_not_previous_delta():
     module = base.model.diffusion_model.linear
     original = module.weight.detach().clone()
     x = torch.randn(3, 8)
+    y0 = F.linear(x, original)
 
     one = _patched_from(base, strength=1.0, mode="bypass")
+    half = _patched_from(base, strength=0.5, mode="bypass")
+
+    # Comfy currently does not compare weight_wrapper_patches inside
+    # clone_has_same_weights(). Distinct runtime-owner keys therefore deliberately
+    # make differently configured Apply results non-equivalent, forcing model
+    # management to reload rather than reusing a stale wrapper set.
+    assert set(one.additional_models) != set(half.additional_models)
+    assert not one.clone_has_same_weights(half)
+
     one.patch_model(device_to=torch.device("cpu"))
     y1 = module(x).detach().clone()
     one.unpatch_model(device_to=torch.device("cpu"))
+    assert torch.equal(module.weight, original)
 
-    half = _patched_from(base, strength=0.5, mode="bypass")
     half.patch_model(device_to=torch.device("cpu"))
     yhalf = module(x).detach().clone()
     half.unpatch_model(device_to=torch.device("cpu"))
-
-    y0 = module(x).detach().clone()
     assert torch.equal(module.weight, original)
+
     assert torch.allclose(yhalf - y0, 0.5 * (y1 - y0), atol=1e-5, rtol=1e-5)
+
+
+def test_runtime_clone_retains_same_owner_and_is_weight_equivalent():
+    base = _base_patcher(runtime_capable=True)
+    vdn = _patched_from(base, strength=0.75, mode="bypass")
+    clone = vdn.clone()
+
+    assert set(vdn.additional_models) == set(clone.additional_models)
+    assert vdn.clone_has_same_weights(clone)
 
 
 def test_external_forward_owner_is_never_mutated_by_runtime_lifecycle():

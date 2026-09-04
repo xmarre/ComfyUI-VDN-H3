@@ -1,16 +1,19 @@
-"""Execution-owned retained helpers layered on the released VDN branch math.
+"""Execution-owned retained helpers layered on the released VDN math.
 
 This module intentionally subclasses :class:`vdn_h3.branch.LinearBranch` instead of
-turning the reference-math module into a cache owner.  The arithmetic remains the
-same; only prefix/suffix bank storage is borrowed from the execution-local
-``RuntimeBuffers`` lease when retention is enabled.
+turning the reference-math module into a cache owner. The arithmetic remains the
+same; only recurrence banks and grouped-window gather storage are borrowed from the
+execution-local ``RuntimeBuffers`` lease when retention is enabled.
 """
 from __future__ import annotations
+
+import collections
 
 import torch
 import torch.nn.functional as F
 
 from vdn_h3 import branch as B
+from vdn_h3 import window as W
 from vdn_h3.runtime import current_runtime_buffers
 
 
@@ -110,3 +113,119 @@ class RuntimeLinearBranch(B.LinearBranch):
             w["norm.weight"].new_tensor(1e-6).item(),
             fuse=self.fuse_epilogue,
         )
+
+
+def _build_window_plan(video_start, video_end, num_frames, tokens_per_frame,
+                       bounds, anchor_frames, seq, device):
+    """Build immutable row-index geometry for one packed-sequence window layout."""
+    def frame_rows(frame):
+        start = video_start + frame * tokens_per_frame
+        return torch.arange(start, start + tokens_per_frame, device=device)
+
+    global_idx = torch.cat([
+        torch.arange(video_start, device=device),
+        torch.arange(video_end, seq, device=device),
+    ])
+    anchors = (0, num_frames - 1)
+    anchor_rows = sorted(
+        frame for frame in anchors
+        if anchor_frames in ("rows", "both"))
+    anchor_set = set(anchor_rows)
+
+    grouped = collections.OrderedDict()
+    for frame in range(num_frames):
+        if frame in anchor_set:
+            continue
+        lo = max(bounds[frame][0], 0)
+        hi = min(bounds[frame][1], num_frames - 1)
+        grouped.setdefault((lo, hi), []).append(frame)
+
+    groups = []
+    max_kv_rows = global_idx.numel()
+    for (lo, hi), frames in grouped.items():
+        extra = [
+            frame for frame in anchors
+            if anchor_frames in ("columns", "both") and not lo <= frame <= hi
+        ]
+        key_frames = sorted(set(range(lo, hi + 1)) | set(extra))
+        win_idx = torch.cat([frame_rows(frame) for frame in key_frames])
+        q_idx = torch.cat([frame_rows(frame) for frame in frames])
+        groups.append((q_idx, win_idx))
+        max_kv_rows = max(max_kv_rows, global_idx.numel() + win_idx.numel())
+
+    return {
+        "global_idx": global_idx,
+        "groups": groups,
+        "anchor_slices": [
+            (
+                video_start + frame * tokens_per_frame,
+                video_start + (frame + 1) * tokens_per_frame,
+            )
+            for frame in anchor_rows
+        ],
+        "max_kv_rows": max_kv_rows,
+    }
+
+
+def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
+                                   num_frames, tokens_per_frame, bounds, scale,
+                                   anchor_frames="none", transformer_options=None):
+    """Grouped exact window softmax with execution-owned plan/KV scratch reuse."""
+    heads, head_dim = query.shape[1], query.shape[2]
+    seq = query.shape[0]
+    resources = current_runtime_buffers()
+    plan_key = (
+        video_start,
+        video_end,
+        num_frames,
+        tokens_per_frame,
+        tuple(map(tuple, bounds)),
+        anchor_frames,
+        seq,
+        str(query.device),
+    )
+    builder = lambda: _build_window_plan(
+        video_start, video_end, num_frames, tokens_per_frame,
+        bounds, anchor_frames, seq, query.device)
+    plan = resources.window_plan(plan_key, builder) if resources is not None else builder()
+
+    out = torch.empty_like(query)
+    global_idx = plan["global_idx"]
+    global_count = global_idx.numel()
+    if global_count:
+        out[global_idx] = W._sdpa(
+            query[global_idx], key, value, scale, transformer_options)
+
+    groups = plan["groups"]
+    if groups:
+        if resources is None:
+            shape = (plan["max_kv_rows"], heads, head_dim)
+            k_scratch = torch.empty(shape, device=key.device, dtype=key.dtype)
+            v_scratch = torch.empty(shape, device=value.device, dtype=value.dtype)
+        else:
+            k_scratch, v_scratch = resources.kv_scratch(
+                plan["max_kv_rows"], heads, head_dim, key.device, key.dtype)
+        if global_count:
+            torch.index_select(key, 0, global_idx, out=k_scratch[:global_count])
+            torch.index_select(value, 0, global_idx, out=v_scratch[:global_count])
+        for q_idx, win_idx in groups:
+            window_rows = win_idx.numel()
+            torch.index_select(
+                key, 0, win_idx,
+                out=k_scratch[global_count:global_count + window_rows])
+            torch.index_select(
+                value, 0, win_idx,
+                out=v_scratch[global_count:global_count + window_rows])
+            q_rows = query.index_select(0, q_idx)
+            out[q_idx] = W._sdpa(
+                q_rows,
+                k_scratch[:global_count + window_rows],
+                v_scratch[:global_count + window_rows],
+                scale,
+                transformer_options,
+            )
+
+    for start, stop in plan["anchor_slices"]:
+        out[start:stop] = W._sdpa(
+            query[start:stop], key, value, scale, transformer_options)
+    return out

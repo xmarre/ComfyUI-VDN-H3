@@ -1,153 +1,38 @@
-"""Applying the converted VDN adapters onto a cloned ModelPatcher.
+"""Apply released VDN adapters through ComfyUI-owned patch mechanisms.
 
-The application machinery is a port of the ComfyUI-MiniMax-H3-Turbo node's
-battle-tested paths (bypass injection with a memory-frugal additive LoRA, merge for
-quantized-fused weights, and the e-grid re-injection for curve/pruned bases' adaln
-updates), adapted to VDN's already-converted ComfyUI key space.
+VDN intentionally does *not* participate in ``BypassForwardHook`` chains.  Ordinary
+LoRA targets, including quantized/fused weights, are registered with
+``ModelPatcher.add_patches`` so Comfy owns backup/restore, low-VRAM application and
+clone semantics.  Full-width AdaLN LoRAs on a curve/pruned H3 base are reconstructed
+at runtime by :mod:`vdn_h3.curve` and installed as ordinary ModelPatcher object
+patches; they are not mutable injection hooks.
 """
+from __future__ import annotations
+
 import logging
-import math
-import os
 
 import torch
-import torch.nn.functional as F
 
-import comfy.ldm.minimax.model
 import comfy.lora
+import comfy.model_management
 import comfy.patcher_extension
 import comfy.utils
-import comfy.weight_adapter
+
+from vdn_h3.curve import (
+    find_dense_time_embedder,
+    make_curve_adaln_forward,
+    make_dense_curve_wrapper,
+)
 
 _log = logging.getLogger("comfy.vdn")
 
-_TURBO_GRID = os.path.join(os.path.dirname(__file__), os.pardir, os.pardir,
-                           "ComfyUI-MiniMax-H3-Turbo", "h3_silu_temb_grid.safetensors")
 
-
-class _FrugalLoRA(comfy.weight_adapter.LoRAAdapter):
-    """LoRA bypass adapter with an in-place additive path (ported from the
-    MiniMax-H3-Turbo node): accumulates up(down(x)) * scale straight into the base
-    output instead of allocating the full-size projection three times."""
-
-    def bypass_forward(self, org_forward, x, *args, **kwargs):
-        base_out = org_forward(x, *args, **kwargs)
-        if getattr(self, "is_conv", False):
-            return super().bypass_forward(org_forward, x, *args, **kwargs)
-        up, down, alpha = self.weights[0], self.weights[1], self.weights[2]
-        rank = down.shape[0]
-        scale = (alpha / rank if alpha is not None else 1.0) \
-            * getattr(self, "multiplier", 1.0)
-        down = down.to(dtype=x.dtype)
-        up = up.to(dtype=x.dtype)
-        return base_out.add_(torch.nn.functional.linear(
-            torch.nn.functional.linear(x, down), up), alpha=scale)
-
-
-def _int8_fused_fc2(dm, modules):
-    """MLP fc2 modules riding ComfyUI's fused int8 matmul: their fused forward reads
-    linear.weight directly and never calls the module forward, so a bypass hook would
-    silently drop the LoRA. Those must go through the merge/weight-function path.
-    (Ported from the MiniMax-H3-Turbo node.)"""
-    fused = []
-    for m in modules:
-        if not m.endswith(".mlp.fc2"):
-            continue
-        try:
-            w = comfy.utils.get_attr(dm, m + ".weight")
-        except Exception:
-            continue
-        if (getattr(w, "_layout_cls", None) == "TensorWiseINT8Layout"
-                and not getattr(getattr(w, "_params", None), "transposed", False)):
-            fused.append(m)
-    return fused
-
-
-def apply_adapters(new_model, converted_by_name, strength, mode, verbose=False):
-    """converted_by_name: {adapter_name: {comfy_module: (A, B, scale)}}. Bypass is the
-    sharp default; merge is the low-VRAM/quantized-friendly path. `strength` is a
-    float applied to every adapter, or {adapter_name: float} for per-adapter
-    control (missing names default to 1.0). Returns a report dict."""
-    per_name = strength if isinstance(strength, dict) else None
-    dm = new_model.get_model_object("diffusion_model")
-    pruned = _is_pruned_base(dm)
-    report = {}
-    all_hooks = []
-    for name, converted in converted_by_name.items():
-        s = per_name.get(name, 1.0) if per_name is not None else strength
-        modules = sorted(converted.keys())
-        lora = {}
-        for path, (a, b, scale) in converted.items():
-            lora[path + ".lora_A.weight"] = a.contiguous()
-            lora[path + ".lora_B.weight"] = b.contiguous()
-            lora[path + ".alpha"] = torch.tensor(scale * a.shape[0])
-        key_map = {m: f"diffusion_model.{m}.weight" for m in modules}
-        loaded = comfy.lora.load_lora(lora, key_map, log_missing=False)
-        sd_keys = set(new_model.model.state_dict().keys())
-
-        if mode == "merge":
-            if pruned:
-                adaln_keys = {key_map[m] for m in modules if _is_adaln(m)}
-                if adaln_keys:
-                    loaded = {k: v for k, v in loaded.items()
-                              if k not in adaln_keys}
-                    _log.warning("[vdn] pruned base: %d adaln deltas cannot merge "
-                                 "into a curve base's collapsed adaln; skipping them "
-                                 "(lora_mode=bypass with the MiniMax-H3-Turbo node "
-                                 "installed keeps them via e-grid re-injection)",
-                                 len(adaln_keys))
-            n = len(new_model.add_patches(loaded, s))
-            report[name] = f"{n} weights merged"
-            continue
-
-        backbone = [m for m in modules if not _is_adaln(m)]
-        adaln = [m for m in modules if _is_adaln(m)]
-        fc2_fused = set(_int8_fused_fc2(dm, backbone))
-        bypass_mods = [m for m in backbone if m not in fc2_fused]
-
-        n = 0
-        if bypass_mods:
-            n += _bypass(new_model, loaded, key_map, bypass_mods, sd_keys, s,
-                         all_hooks)
-        if fc2_fused:
-            n += len(new_model.add_patches(
-                {k: v for k, v in loaded.items()
-                 if k in {key_map[m] for m in fc2_fused}}, s))
-        if adaln:
-            if pruned:
-                grid_path = os.path.abspath(_TURBO_GRID)
-                if not os.path.exists(grid_path):
-                    # Curve bases cannot take the adaln deltas through the normal
-                    # paths (that is what the per-block '[96768, 8]' reshape errors
-                    # were); skipping them is near-visual-neutral per community
-                    # testing. One warning instead of 50 ERROR lines.
-                    _log.warning("[vdn] pruned base: %d adaln adapters skipped "
-                                 "(needs the silu-temb grid from the "
-                                 "ComfyUI-MiniMax-H3-Turbo node at %s)",
-                                 len(adaln), grid_path)
-                    report[name] = (f"{n} adapters ({len(bypass_mods)} bypass, "
-                                    f"{len(fc2_fused)} int8-fc2 merged, "
-                                    f"{len(adaln)} adaln SKIPPED)")
-                    continue
-                _inject_adaln_egrid(new_model, dm, lora, adaln, s)
-                n += len(adaln)
-            else:
-                n += _bypass(new_model, loaded, key_map, adaln, sd_keys, s,
-                             all_hooks)
-        report[name] = (f"{n} adapters ({len(bypass_mods)} bypass, "
-                        f"{len(fc2_fused)} int8-fc2 merged, {len(adaln)} adaln)")
-    _install_injection(new_model, all_hooks)
-    return report
-
-
-def _is_adaln(module):
+def _is_adaln(module: str) -> bool:
     return module.endswith(".adaln_proj.linear")
 
 
-def _is_pruned_base(dm):
-    """Curve/pruned bases collapse adaln_proj.linear to a tiny t-feature input
-    (the [96768, 8] weights); the trained weight takes the full silu(t_emb)
-    width. The model flag alone missed some pruned checkpoints (issues #3/#5),
-    so the weight shape is the reliable tell."""
+def _is_pruned_base(dm) -> bool:
+    """Return whether H3 consumes the collapsed AdaLN curve basis."""
     if getattr(dm, "use_adaln_curves", False):
         return True
     try:
@@ -157,168 +42,150 @@ def _is_pruned_base(dm):
         return False
 
 
-def _bypass(new_model, loaded, key_map, modules, sd_keys, strength, hooks):
-    manager = comfy.weight_adapter.BypassInjectionManager()
-    n = 0
-    for module in modules:
-        key = key_map[module]
-        adapter = loaded.get(key)
-        if adapter is None or key not in sd_keys:
-            continue
-        if isinstance(adapter, comfy.weight_adapter.LoRAAdapter):
-            adapter = _FrugalLoRA(adapter.loaded_keys, adapter.weights)
-        elif not isinstance(adapter, comfy.weight_adapter.WeightAdapterBase):
-            continue
-        manager.add_adapter(key, adapter, strength=strength)
-        n += 1
-    manager.create_injections(new_model.model)
-    hooks.extend(manager.hooks)
-    return n
+def _comfy_lora(converted):
+    lora = {}
+    for path, (a, b, scale) in converted.items():
+        rank = a.shape[0]
+        lora[path + ".lora_A.weight"] = a.contiguous()
+        lora[path + ".lora_B.weight"] = b.contiguous()
+        lora[path + ".alpha"] = torch.tensor(scale * rank)
+    return lora
 
 
-def _install_injection(new_model, hooks):
-    """All bypass hooks go through ONE PatcherInjection whose eject unwinds in
-    reverse. ComfyUI applies injection sets in list order on load and on unload;
-    with two stacked adapter sets (default + turbo), forward-order eject restores
-    a stale hook as module.forward, and the next load captures that hook as its
-    own "original" -- infinite self-recursion on the second run (observed as
-    RecursionError after a model reload). LIFO eject always restores the true
-    forward, so load/unload cycles are stable.
+def _native_patch_adapter(new_model, converted, strength: float) -> int:
+    """Register one adapter entirely through ``ModelPatcher.add_patches``.
 
-    STACK-PROOFING: every Apply-VDN run clones the patcher but every clone shares
-    ONE inner model, and ComfyUI ejects a clone's injections only when that clone
-    is UNLOADED -- on a big-VRAM card nothing unloads between runs, so re-running
-    with any widget changed (e.g. flipping lora_mode) would otherwise stack
-    ANOTHER full set of bypass hooks on the same modules: 2x, 3x the LoRA delta
-    per rerun, progressively grainy/fried output (merge is immune -- weight
-    patches go through backup/restore). The live hook set is tracked on the
-    shared inner model and ejected before a new set goes in."""
-    if not hooks:
-        return
-    owner = new_model.model      # shared by every clone of this model
+    This is the same path Comfy uses for normal LoRAs and is intentionally used for
+    fused/quantized FC2 as well: the patcher knows how a quantized parameter must be
+    converted/materialized, whereas a module-forward hook does not.
+    """
+    if not converted:
+        return 0
+    modules = sorted(converted)
+    lora = _comfy_lora(converted)
+    key_map = {module: f"diffusion_model.{module}.weight" for module in modules}
+    state_keys = set(new_model.model.state_dict().keys())
+    missing_base = sorted(key_map[m] for m in modules if key_map[m] not in state_keys)
+    if missing_base:
+        raise RuntimeError(
+            "VDN adapter targets are absent from the loaded MiniMax-H3 base: "
+            + ", ".join(missing_base[:8])
+            + (" ..." if len(missing_base) > 8 else ""))
 
-    def inject_all(model_patcher):
-        old = getattr(owner, "_vdn_live_hooks", None)
-        if old:
-            for hook in reversed(old):
-                hook.eject()
-        for hook in hooks:
-            hook.inject()
-        owner._vdn_live_hooks = hooks
-
-    def eject_all(model_patcher):
-        for hook in reversed(hooks):
-            hook.eject()
-        if getattr(owner, "_vdn_live_hooks", None) is hooks:
-            owner._vdn_live_hooks = None
-
-    injection = comfy.patcher_extension.PatcherInjection(
-        inject=inject_all, eject=eject_all)
-    new_model.set_injections("vdn_lora", [injection])
+    loaded = comfy.lora.load_lora(lora, key_map, log_missing=False)
+    expected = {key_map[m] for m in modules}
+    missing_loaded = sorted(expected - set(loaded))
+    if missing_loaded:
+        raise RuntimeError(
+            "ComfyUI could not materialize VDN LoRA targets: "
+            + ", ".join(missing_loaded[:8])
+            + (" ..." if len(missing_loaded) > 8 else ""))
+    accepted = set(new_model.add_patches(
+        {key: loaded[key] for key in expected}, strength))
+    missing_patch = sorted(expected - accepted)
+    if missing_patch:
+        raise RuntimeError(
+            "ModelPatcher rejected VDN adapter targets: "
+            + ", ".join(missing_patch[:8])
+            + (" ..." if len(missing_patch) > 8 else ""))
+    return len(accepted)
 
 
-# ------------------------------------------------------- pruned-base adaln path --
+def _install_curve_adaln(new_model, dm, stage_path, terms_by_module):
+    """Install exact full-width AdaLN deltas on a curve H3 base.
 
-_EGRID = None
+    ``terms_by_module`` contains the original dense LoRA factors; no low-rank curve
+    projection is performed.  ModelPatcher owns every changed object and restores it
+    on unload before/after other providers according to core lifecycle semantics.
+    """
+    if not terms_by_module:
+        return None
+    if stage_path is None:
+        raise RuntimeError("VDN curve AdaLN reconstruction requires the stage path")
 
+    table = getattr(dm, "adaln_t_table", None)
+    if table is None:
+        raise RuntimeError(
+            "MiniMax-H3 was detected as a curve/pruned base but has no adaln_t_table")
+    if getattr(table, "device", None) is not None and table.device.type == "meta":
+        raise RuntimeError(
+            "MiniMax-H3 adaln_t_table is still on the meta device; load the base "
+            "checkpoint before applying VDN")
+    table_cpu = table.detach().to(torch.float32, device="cpu").clone()
+    embedder, residual = find_dense_time_embedder(stage_path, table_cpu)
+    _log.info("[vdn] curve AdaLN source: %s (base-curve residual %.3e)",
+              embedder.source, residual)
 
-def _egrid():
-    global _EGRID
-    if _EGRID is None:
-        path = os.path.abspath(_TURBO_GRID)
-        if not os.path.exists(path):
-            raise RuntimeError(
-                "This VDN adapter updates the adaln projections, but the loaded base "
-                "is a pruned (curve) MiniMax-H3 whose adaln weights were collapsed. "
-                "Re-injection needs the silu(t_emb) grid bundled with the "
-                "ComfyUI-MiniMax-H3-Turbo node; expected it at: " + path)
-        _EGRID = comfy.utils.load_torch_file(path)["silu_t_emb_grid"]
-    return _EGRID
-
-
-def _interp_egrid(unique_t, e, device, dtype):
-    e = e.to(device)
-    n = e.shape[0]
-    rows = []
-    for t in unique_t:
-        pos = min(max(t, 0.0), 1.0) * (n - 1)
-        i0 = min(int(math.floor(pos)), n - 2)
-        rows.append(torch.lerp(e[i0].float(), e[i0 + 1].float(), pos - i0))
-    return torch.stack(rows).to(dtype)
-
-
-def _unique_t(timestep, shift_v, shift_a, payload):
-    """Mirror of the model's unique-timestep row computation (ported from the
-    MiniMax-H3-Turbo node)."""
-    sigma_v = (timestep.flatten()[0] / 1000.0).float().clamp(min=1e-6)
-    t_v = float(1.0 - sigma_v)
-    t_a = float(1.0 - comfy.ldm.minimax.model.time_shift_sigma(sigma_v, shift_v,
-                                                              shift_a))
-    s = {t_v, t_a}
-    refs = payload.get("refs") or ()
-    if payload.get("keyframes") or any(r.get("kind") == "image" for r in refs):
-        s.add(max(t_v, float(payload.get("visual_cond_noise_aug", 0.999))))
-    if any(r.get("kind") == "audio" and r.get("ref_audio_t", 0) > 0 for r in refs):
-        s.add(max(t_a, float(payload.get("audio_cond_noise_aug", 1.0))))
-    return sorted(s)
-
-
-def _make_adaln_forward(base, a, b, shared, table=None, egrid=None):
-    """Curve-mode adaln injection as a forward-attribute patch (ported from the
-    MiniMax-H3-Turbo node, which documents why the module tree must stay untouched)."""
-
-    def forward(t_emb):
-        x = base.linear(F.silu(t_emb) if base.apply_silu else t_emb)
-        st = None
-        if table is not None and egrid is not None and not base.apply_silu:
-            try:
-                tb = table.to(t_emb.device, torch.float32)
-                idx = torch.cdist(t_emb.detach().float(), tb).argmin(dim=1)
-                st = egrid.to(t_emb.device)[idx]
-            except Exception:
-                st = None
-        if st is None:
-            st = shared.get("silu_temb")
-        if st is not None and st.shape[0] == x.shape[0]:
-            av = a.to(x.device, x.dtype)
-            bv = b.to(x.device, x.dtype)
-            sv = st.to(x.device, x.dtype)
-            x = x + (bv @ (av @ sv.T)).T
-        x = x.view(x.shape[0] * base.modalities, base.expand * base.hidden)
-        return x.chunk(base.expand, dim=-1)
-
-    return forward
-
-
-def _inject_adaln_egrid(new_model, dm, lora, adaln_modules, strength):
-    e = _egrid()
-    shared = {"silu_temb": None}
-    shift_v = float(getattr(dm, "sigma_shift_video", 12.0))
-    shift_a = float(getattr(dm, "sigma_shift_audio", 3.0))
-
-    tt = None
-    for _n, _t in list(dm.named_buffers()) + list(dm.named_parameters()):
-        if _n.endswith("adaln_t_table"):
-            tt = _t
-            break
-    if tt is not None and tt.shape[0] != e.shape[0]:
-        tt = None
-
-    def wrap(executor, *args, **kwargs):
-        ts = args[1] if len(args) > 1 else kwargs.get("timestep")
-        ctx = args[2] if len(args) > 2 else kwargs.get("context")
-        payload = kwargs.get("minimax_payload") or {}
-        shared["silu_temb"] = _interp_egrid(
-            _unique_t(ts, shift_v, shift_a, payload), e, ctx.device, ctx.dtype)
-        return executor(*args, **kwargs)
-
+    shared = {"dense_silu_temb": None}
+    wrapper_key = "vdn_curve_adaln"
     new_model.add_wrapper_with_key(
-        comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "vdn_adaln", wrap)
-    for name in adaln_modules:
-        a = lora[name + ".lora_A.weight"]
-        b = lora[name + ".lora_B.weight"] * strength
-        key = "diffusion_model." + name.rsplit(".linear", 1)[0]
-        new_model.add_object_patch(
-            key + ".forward",
-            _make_adaln_forward(new_model.get_model_object(key), a, b, shared, tt, e))
+        comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
+        wrapper_key,
+        make_dense_curve_wrapper(dm, embedder, shared),
+    )
 
+    for module, terms in terms_by_module.items():
+        parent = module.rsplit(".linear", 1)[0]
+        object_key = f"diffusion_model.{parent}.forward"
+        existing = new_model.object_patches.get(object_key)
+        if existing is not None and not getattr(existing, "_vdn_curve_adaln", False):
+            raise RuntimeError(
+                f"VDN needs to patch {object_key} for exact curve AdaLN, but another "
+                "object patch already owns that forward. Apply VDN before the "
+                "conflicting provider or remove that incompatible patch.")
+        base = new_model.get_model_object(f"diffusion_model.{parent}")
+        new_model.add_object_patch(
+            object_key,
+            make_curve_adaln_forward(base, terms, shared),
+        )
+    return embedder.source, residual
+
+
+def apply_adapters(new_model, converted_by_name, strength, mode="merge",
+                   stage_path=None, verbose=False):
+    """Apply converted released adapters to a cloned MiniMax-H3 ModelPatcher.
+
+    ``mode`` remains in the Python signature only so old serialized workflows fail
+    with an explicit migration message.  The node UI exposes only ``merge``.
+    ``strength`` may be one float or ``{adapter_name: float}``.
+    """
+    if mode != "merge":
+        raise RuntimeError(
+            "VDN lora_mode='bypass' was removed because mutable module.forward "
+            "BypassForwardHook chains are not lifecycle-safe across ModelPatcher "
+            "clones/Continuum chunks. Use lora_mode='merge'; adapters now use "
+            "ComfyUI's native patch ownership.")
+
+    per_name = strength if isinstance(strength, dict) else None
+    dm = new_model.get_model_object("diffusion_model")
+    pruned = _is_pruned_base(dm)
+    report = {}
+    curve_terms = {}
+
+    for name, converted in converted_by_name.items():
+        s = float(per_name.get(name, 1.0) if per_name is not None else strength)
+        ordinary = {}
+        curve_count = 0
+        for path, (a, b, scale) in converted.items():
+            if pruned and _is_adaln(path):
+                curve_terms.setdefault(path, []).append((a, b, float(scale) * s))
+                curve_count += 1
+            else:
+                ordinary[path] = (a, b, scale)
+
+        patched = _native_patch_adapter(new_model, ordinary, s)
+        report[name] = {
+            "native_weight_patches": patched,
+            "curve_adaln": curve_count,
+            "strength": s,
+        }
+        if verbose:
+            _log.info("[vdn] adapter %s: %d native weight patches, %d curve AdaLN",
+                      name, patched, curve_count)
+
+    curve_source = _install_curve_adaln(
+        new_model, dm, stage_path, curve_terms) if curve_terms else None
+    if curve_source is not None:
+        report["curve_adaln_source"] = {
+            "source": curve_source[0], "residual": curve_source[1]}
+    return report

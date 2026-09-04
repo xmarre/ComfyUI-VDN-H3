@@ -89,8 +89,11 @@ def _load_official_hybrid():
     branch = _load("official_hybrid_branch", "src/models/linear_attention/branch.py")
     linear_pkg.BidirectionalLinearBranch = branch.BidirectionalLinearBranch
 
+    # Register under the exact canonical module name imported by the released
+    # HybridAttention class. This keeps the oracle's dependency wiring faithful to
+    # OpenVDN rather than substituting a lookalike helper module.
     softmax_kernels = _load(
-        "official_hybrid_softmax_kernels",
+        "src.models.softmax_attention.kernels",
         "src/models/softmax_attention/kernels.py",
     )
     softmax_pkg = sys.modules["src.models.softmax_attention"]

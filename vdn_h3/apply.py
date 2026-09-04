@@ -8,7 +8,7 @@ for the low-rank A/B tensors. VDN never traverses, replaces, splices or restores
 LoRA-target ``module.forward`` methods.
 
 Full-width AdaLN LoRAs on a curve/pruned H3 base are reconstructed at runtime by
-:mod:`vdn_h3.curve` and installed as ordinary ModelPatcher object patches.
+:mod:`vdn_h3.curve`; their A/B factors share the same Comfy-managed low-rank model.
 """
 from __future__ import annotations
 
@@ -39,7 +39,6 @@ def _is_adaln(module: str) -> bool:
 
 
 def _is_pruned_base(dm) -> bool:
-    """Return whether H3 consumes the collapsed AdaLN curve basis."""
     if getattr(dm, "use_adaln_curves", False):
         return True
     try:
@@ -94,19 +93,7 @@ def _native_patch_adapter(new_model, converted, strength: float) -> int:
 
 
 class _RuntimeLoRAWeight:
-    """Stateless low-VRAM LoRA weight wrapper owned by ``ModelPatcher``.
-
-    The low-rank tensors themselves live in a separate additional ModelPatcher. This
-    wrapper only stores their logical module key. On a loaded model those Parameters
-    are already on the compute device; if Comfy offloads them, ``terms_on`` performs
-    the ordinary managed transfer without creating a private cache.
-
-    The current layer receives one transient compute-dtype weight. Each low-rank
-    delta is calculated in bounded row chunks, scaled, and added to that tensor. This
-    follows the eager merge operation order (``mm`` -> scale -> add) more closely than
-    an activation bypass while bounding the extra delta allocation instead of
-    materializing another full-size ``B @ A`` tensor.
-    """
+    """Stateless runtime weight wrapper with bounded delta temporary memory."""
 
     __slots__ = ("key", "module", "source", "_vdn_runtime_lora")
 
@@ -122,9 +109,6 @@ class _RuntimeLoRAWeight:
         return max(1, _RUNTIME_DELTA_BUFFER_BYTES // row_bytes)
 
     def __call__(self, weight):
-        # Current Comfy dequantizes a QuantizedTensor before weight_function entries
-        # run. Refuse any future path that hands us opaque storage instead of quietly
-        # creating a different representation ourselves.
         if not isinstance(weight, torch.Tensor) or not weight.is_floating_point():
             raise RuntimeError(
                 f"VDN runtime LoRA for {self.key} expected a floating compute weight; "
@@ -134,8 +118,7 @@ class _RuntimeLoRAWeight:
         if compute_dtype is None:
             compute_dtype = weight.dtype
         out = weight.to(dtype=compute_dtype, copy=True)
-        terms = self.source.terms_on(
-            self.module, out.device, compute_dtype)
+        terms = self.source.terms_on(self.module, out.device, compute_dtype)
 
         for av, bv, scale in terms:
             if scale == 0.0:
@@ -183,34 +166,27 @@ def _validate_runtime_weight_targets(new_model, terms_by_module):
                     f"weight is {expected_shape}")
 
 
-def _install_runtime_weight_adapters(new_model, terms_by_module):
-    """Install stateless wrappers plus Comfy-managed low-rank tensor ownership."""
+def _install_runtime_weight_adapters(new_model, terms_by_module, managed):
     if not terms_by_module:
-        return 0, 0
-
+        return 0
     _validate_runtime_weight_targets(new_model, terms_by_module)
-    managed, managed_patcher = make_managed_runtime_lora_patcher(
-        terms_by_module, new_model)
-    new_model.set_additional_models("vdn_runtime_lora", [managed_patcher])
-
     installed = 0
     for module in sorted(terms_by_module):
         key = f"diffusion_model.{module}.weight"
         new_model.add_weight_wrapper(
             key, _RuntimeLoRAWeight(key, module, managed))
         installed += 1
-
-    managed_bytes = sum(
-        p.numel() * p.element_size() for p in managed.parameters())
-    return installed, managed_bytes
+    return installed
 
 
-def _install_curve_adaln(new_model, dm, stage_path, terms_by_module):
+def _install_curve_adaln(new_model, dm, stage_path, terms_by_module, managed):
     """Install exact full-width AdaLN deltas on a curve H3 base."""
     if not terms_by_module:
         return None
     if stage_path is None:
         raise RuntimeError("VDN curve AdaLN reconstruction requires the stage path")
+    if managed is None:
+        raise RuntimeError("VDN curve AdaLN terms have no managed runtime owner")
 
     table = getattr(dm, "adaln_t_table", None)
     if table is None:
@@ -226,14 +202,13 @@ def _install_curve_adaln(new_model, dm, stage_path, terms_by_module):
               embedder.source, residual)
 
     state = CurveAdalnState()
-    wrapper_key = "vdn_curve_adaln"
     new_model.add_wrapper_with_key(
         comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
-        wrapper_key,
+        "vdn_curve_adaln",
         make_dense_curve_wrapper(dm, embedder, state),
     )
 
-    for module, terms in terms_by_module.items():
+    for module in terms_by_module:
         parent = module.rsplit(".linear", 1)[0]
         object_key = f"diffusion_model.{parent}.forward"
         existing = new_model.object_patches.get(object_key)
@@ -245,20 +220,23 @@ def _install_curve_adaln(new_model, dm, stage_path, terms_by_module):
         base = new_model.get_model_object(f"diffusion_model.{parent}")
         new_model.add_object_patch(
             object_key,
-            make_curve_adaln_forward(base, terms, state),
+            make_curve_adaln_forward(
+                base, managed, state, managed_module=module),
         )
     return embedder.source, residual
 
 
+def _merge_runtime_terms(*groups):
+    combined = {}
+    for group in groups:
+        for module, terms in group.items():
+            combined.setdefault(module, []).extend(terms)
+    return combined
+
+
 def apply_adapters(new_model, converted_by_name, strength, mode="merge",
                    stage_path=None, verbose=False):
-    """Apply converted released adapters to a cloned MiniMax-H3 ModelPatcher.
-
-    ``merge`` uses normal Comfy weight patches. ``bypass`` is the compatibility name
-    for VDN's low-VRAM runtime mode; unlike the removed implementation it uses
-    ``ModelPatcher.add_weight_wrapper`` and never replaces ``module.forward``.
-    ``strength`` may be one float or ``{adapter_name: float}``.
-    """
+    """Apply released adapters through merge or safe runtime-low-VRAM mode."""
     if mode not in ("merge", "bypass"):
         raise ValueError(f"VDN lora_mode must be 'merge' or 'bypass', got {mode!r}")
 
@@ -298,8 +276,18 @@ def apply_adapters(new_model, converted_by_name, strength, mode="merge",
                 "%d curve AdaLN",
                 name, patched, runtime_count, curve_count)
 
-    runtime_wrappers, managed_bytes = _install_runtime_weight_adapters(
-        new_model, runtime_terms) if runtime_terms else (0, 0)
+    managed_terms = _merge_runtime_terms(runtime_terms, curve_terms)
+    managed = None
+    managed_bytes = 0
+    if managed_terms:
+        managed, managed_patcher = make_managed_runtime_lora_patcher(
+            managed_terms, new_model)
+        new_model.set_additional_models("vdn_runtime_lora", [managed_patcher])
+        managed_bytes = sum(
+            p.numel() * p.element_size() for p in managed.parameters())
+
+    runtime_wrappers = _install_runtime_weight_adapters(
+        new_model, runtime_terms, managed) if runtime_terms else 0
     if runtime_wrappers:
         report["runtime_lowvram"] = {
             "weight_wrappers": runtime_wrappers,
@@ -309,8 +297,11 @@ def apply_adapters(new_model, converted_by_name, strength, mode="merge",
         }
 
     curve_source = _install_curve_adaln(
-        new_model, dm, stage_path, curve_terms) if curve_terms else None
+        new_model, dm, stage_path, curve_terms, managed) if curve_terms else None
     if curve_source is not None:
         report["curve_adaln_source"] = {
-            "source": curve_source[0], "residual": curve_source[1]}
+            "source": curve_source[0],
+            "residual": curve_source[1],
+            "managed_adapter_bytes": managed_bytes,
+        }
     return report

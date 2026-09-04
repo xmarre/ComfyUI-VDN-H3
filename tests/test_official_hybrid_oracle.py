@@ -57,7 +57,7 @@ def _load_official_hybrid():
     window = _load("official_hybrid_window", "src/models/softmax_attention/window.py")
     delta = _load("src.models.linear_attention.delta_rule",
                   "src/models/linear_attention/delta_rule.py")
-    scan = _load("src.models.linear_attention.scan", "src/models/linear_attention/scan.py")
+    _load("src.models.linear_attention.scan", "src/models/linear_attention/scan.py")
 
     temporal = types.ModuleType("src.models.ops.temporal_conv")
     temporal.temporal_conv_activate = lambda *a, **k: (_ for _ in ()).throw(
@@ -67,8 +67,8 @@ def _load_official_hybrid():
                      "src/models/linear_attention/features.py")
     _load("src.models.ops.rms_norm", "src/models/ops/rms_norm.py")
     gates = _load("src.models.attention_gates", "src/models/attention_gates.py")
-    kernels = _load("src.models.linear_attention.kernels",
-                    "src/models/linear_attention/kernels.py")
+    _load("src.models.linear_attention.kernels",
+          "src/models/linear_attention/kernels.py")
     _load("src.models.linear_attention.layers", "src/models/linear_attention/layers.py")
 
     key_mapping = types.ModuleType("src.checkpoints.key_mapping")
@@ -81,8 +81,15 @@ def _load_official_hybrid():
     branch = _load("official_hybrid_branch", "src/models/linear_attention/branch.py")
     linear_pkg.BidirectionalLinearBranch = branch.BidirectionalLinearBranch
 
+    # HybridAttention imports apply_softmax_gate from the softmax package. Wire that
+    # package from the pinned OpenVDN softmax implementation itself; do not substitute
+    # the similarly named linear-attention kernels module.
+    softmax_kernels = _load(
+        "official_hybrid_softmax_kernels",
+        "src/models/softmax_attention/kernels.py",
+    )
     softmax_pkg = sys.modules["src.models.softmax_attention"]
-    softmax_pkg.apply_softmax_gate = kernels.apply_softmax_gate
+    softmax_pkg.apply_softmax_gate = softmax_kernels.apply_softmax_gate
     softmax_pkg.window_bounds = window.window_bounds
     softmax_pkg.window_softmax_reference = window.window_softmax_reference
     softmax_pkg.build_window_block_mask = lambda *a, **k: (_ for _ in ()).throw(

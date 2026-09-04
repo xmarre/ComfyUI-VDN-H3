@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 
+import pytest
 import torch
+from torch import nn
 from safetensors.torch import save_file
 
 import vdn_h3.curve as curve
@@ -62,6 +64,79 @@ def test_dense_curve_wrapper_is_reentrant(monkeypatch):
 
     assert wrapper(outer_executor, x, torch.tensor([0.25]), context, {}) == "outer"
     assert state.get() is None
+
+
+class _CurveAdaln(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.apply_silu = False
+        self.modalities = 1
+        self.expand = 2
+        self.hidden = 3
+        self.linear = nn.Linear(2, self.modalities * self.expand * self.hidden, bias=True)
+
+
+def _flatten_chunks(chunks):
+    return torch.cat(chunks, dim=-1)
+
+
+def test_curve_adaln_adds_original_dense_low_rank_delta_exactly():
+    torch.manual_seed(301)
+    base = _CurveAdaln()
+    state = curve.CurveAdalnState()
+    curve_input = torch.randn(4, 2)
+    dense_input = torch.randn(4, 5)
+    a = torch.randn(3, 5)
+    b = torch.randn(6, 3)
+    scale = 0.625
+
+    forward = curve.make_curve_adaln_forward(base, [(a, b, scale)], state)
+    token = state.push(dense_input)
+    try:
+        got = _flatten_chunks(forward(curve_input))
+    finally:
+        state.reset(token)
+
+    base_out = base.linear(curve_input)
+    expected = base_out + torch.nn.functional.linear(
+        torch.nn.functional.linear(dense_input, a), b) * scale
+    assert torch.allclose(got, expected, atol=2e-6, rtol=2e-6)
+
+
+def test_curve_adaln_strength_scaling_is_linear_and_does_not_touch_base_curve():
+    torch.manual_seed(302)
+    base = _CurveAdaln()
+    base_weight = base.linear.weight.detach().clone()
+    base_bias = base.linear.bias.detach().clone()
+    state = curve.CurveAdalnState()
+    curve_input = torch.randn(3, 2)
+    dense_input = torch.randn(3, 5)
+    a = torch.randn(2, 5)
+    b = torch.randn(6, 2)
+
+    full = curve.make_curve_adaln_forward(base, [(a, b, 1.0)], state)
+    half = curve.make_curve_adaln_forward(base, [(a, b, 0.5)], state)
+    token = state.push(dense_input)
+    try:
+        y_full = _flatten_chunks(full(curve_input))
+        y_half = _flatten_chunks(half(curve_input))
+    finally:
+        state.reset(token)
+    y_base = base.linear(curve_input)
+
+    assert torch.allclose(y_half - y_base, 0.5 * (y_full - y_base), atol=2e-6, rtol=2e-6)
+    assert torch.equal(base.linear.weight, base_weight)
+    assert torch.equal(base.linear.bias, base_bias)
+
+
+def test_curve_adaln_requires_execution_local_dense_state():
+    base = _CurveAdaln()
+    state = curve.CurveAdalnState()
+    a = torch.randn(2, 5)
+    b = torch.randn(6, 2)
+    forward = curve.make_curve_adaln_forward(base, [(a, b, 1.0)], state)
+    with pytest.raises(RuntimeError, match="state is unavailable"):
+        forward(torch.randn(2, 2))
 
 
 def test_root_prefix_is_valid_dense_checkpoint_candidate(tmp_path, monkeypatch):

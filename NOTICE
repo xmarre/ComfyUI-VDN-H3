@@ -1,0 +1,41 @@
+ComfyUI-VDN-H3
+Copyright 2026 Saganaki22 and contributors.
+VDN-H3 architecture and ported implementation: Copyright OpenVDN
+(github.com/OpenVDN/vdn-minimax-h3).
+
+This repository contains ComfyUI integration code for VDN-H3 and is licensed under
+the Apache License, Version 2.0 (see LICENSE). It does not distribute MiniMax-H3 or
+VDN-H3 model weights.
+
+The implementation originates from Saganaki22/ComfyUI-VDN-H3 and ports/adapts the
+VDN-H3 architecture and algorithms released by OpenVDN/vdn-minimax-h3. OpenVDN's
+source repository is also licensed under Apache-2.0. Preserve the upstream copyright,
+license and attribution notices when redistributing derived source.
+
+--------------------------------------------------------------------------------
+MiniMax H3 / VDN-H3 model weights
+--------------------------------------------------------------------------------
+
+MiniMax H3 is licensed under the MiniMax H3 Community License Agreement,
+Copyright © 2026 MiniMax. All Rights Reserved.
+
+OpenVDN states in its NOTICE that VDN-H3 weights are derivatives of MiniMax H3 and
+are distributed separately at https://huggingface.co/OpenVDN/vdn-minimax-h3 under
+the MiniMax H3 Community License Agreement. This Apache-2.0 source-code license does
+not relicense those weights.
+
+OpenVDN's current NOTICE states that the public agreement grants rights only within
+its "Applicable Territory", defined as worldwide excluding the European Union, the
+United Kingdom, the Republic of Korea, and the United States of America, and that it
+also incorporates an Acceptable Use Policy. Read the current agreement in full before
+downloading or running MiniMax H3 or a derivative. The authoritative upstream copy
+is included in OpenVDN/vdn-minimax-h3 under:
+
+    licenses/MiniMax-H3-Community-License-Agreement.txt
+
+Upstream references:
+- https://github.com/OpenVDN/vdn-minimax-h3
+- https://github.com/Saganaki22/ComfyUI-VDN-H3
+- https://github.com/Comfy-Org/ComfyUI
+- https://huggingface.co/OpenVDN/vdn-minimax-h3
+- https://huggingface.co/Comfy-Org/MiniMax-H3

@@ -372,8 +372,8 @@ def apply_adapters(
         report[name] = {
             "native_weight_patches": native_patches,
             "runtime_bypass_targets": bypass_targets,
-            # Kept for one release as a compatibility/logging alias. It no longer
-            # means ModelPatcher weight wrappers in v1.5.1.
+            # Kept as a compatibility/logging alias. In v1.5.2 it counts
+            # non-mutating runtime adapter terms, not ModelPatcher weight wrappers.
             "runtime_weight_targets": bypass_targets,
             "fused_native_targets": fused_native_targets,
             "curve_adaln": curve_count,
@@ -448,6 +448,7 @@ def apply_adapters(
             "delta_buffer_limit_bytes": 0,
             "owner_key": None,
             "stack_safe_cross_provider": True,
+            "cross_provider_forward_chain_independent": True,
             "projected_curve_weight_patches": curve_weight_patches,
             "projected_curve_bias_patches": curve_bias_patches,
         }

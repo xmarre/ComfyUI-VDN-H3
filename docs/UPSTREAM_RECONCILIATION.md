@@ -32,20 +32,27 @@ The fork does not retain process-global model-weight ownership:
 - completed prefetch results cannot be overwritten before `take()` consumes them;
 - Flex BlockMask caching is bounded and keyed by device/layout identity.
 
-## Adapter lifecycle: v1.5.1
+## Adapter lifecycle: v1.5.2
 
 `merge` remains normal `ModelPatcher.add_patches()` ownership.
 
-For ordinary LoRA targets, `lora_mode=bypass` uses Comfy `BypassForwardHook` objects but **not** the unsafe plain provider lifecycle. VDN wraps those hooks in a stack-safe `PatcherInjection` derived from the production-validated PR #1 fix:
+For ordinary LoRA targets, `lora_mode=bypass` uses VDN-owned PyTorch forward post-hooks. VDN intentionally does not use either of the two adapter-execution topologies that failed the real stacked quantized workflow:
 
-- VDN is inserted inside an already-active independent Comfy bypass chain;
-- VDN can be spliced out while another provider remains active;
-- both provider insertion orders are supported;
-- clone-shared reruns replace the old live VDN hook set instead of accumulating deltas;
-- cyclic existing chains fail closed;
+- no `weight_function` / `add_weight_wrapper` execution from v1.5.0;
+- no VDN `BypassForwardHook` linked list or custom `module.forward` splicing from v1.5.1.
+
+Instead:
+
+- the existing module forward executes normally;
+- any independently managed runtime provider keeps sole ownership of whatever forward wrapper chain it installs;
+- VDN adds its exact low-rank residual from a PyTorch post-hook after that call returns;
+- all VDN terms for one module are combined into one post-hook residual;
+- one generation-owned `PatcherInjection` registers/removes the handles;
+- a newer clone-shared VDN generation replaces the older registration;
+- stale older ejects cannot remove the newer generation;
 - fused INT8 `mlp.fc2` targets that bypass `module.forward` remain ordinary weight patches.
 
-v1.5.0 temporarily replaced this with `weight_function` / `add_weight_wrapper` runtime LoRA execution. That path forced quantized H3 layers through Comfy's dequantized compute-weight route and regressed the real stacked VDN + external runtime-DoRA workflow into a CUDA illegal-memory-access abort. v1.5.1 removes that active execution path.
+The v1.5.1 real-workflow failure was asynchronously reported at core `LoRAAdapter.h` / `BypassForwardHook` during the first H3 evaluation. That stack is not sufficient to identify the originating CUDA kernel or to blame the independent provider. v1.5.2 therefore narrows the fix to the VDN-owned topology: VDN no longer participates in the mutable forward chain at all.
 
 Full-width released AdaLN LoRAs on supported pruned/curve H3 bases are still projected through the exact pruning affine, including the required constant bias term. The already-native projected curve weight/bias terms use normal Comfy patches in both adapter modes.
 

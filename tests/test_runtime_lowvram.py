@@ -66,6 +66,7 @@ def test_bypass_apply_uses_injection_and_never_weight_wrappers(monkeypatch):
     assert runtime["managed_adapter_bytes"] == 0
     assert runtime["owner_key"] is None
     assert runtime["stack_safe_cross_provider"] is True
+    assert runtime["cross_provider_forward_chain_independent"] is True
 
     x = torch.randn(4, 8)
     base_out = true_forward(x)

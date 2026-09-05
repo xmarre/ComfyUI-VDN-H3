@@ -1,0 +1,35 @@
+name: Staging v1.5.2 forward-hook bypass
+
+on:
+  push:
+    branches:
+      - staging/v1.5.2-forward-hook-bypass-20260905
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply deterministic staging patch
+        run: python tools/stage_v152_forward_hook.py
+      - name: Static syntax check
+        run: |
+          python -m compileall -q vdn_h3 tests tools
+          git diff --check
+      - name: Commit staged production changes
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add vdn_h3/apply.py tests/test_bypass_reinject.py tests/test_quantized_patch.py tests/test_runtime_lowvram.py tests/test_curve_apply.py pyproject.toml README.md RELEASE_NOTES.md
+          git diff --cached --quiet && exit 1
+          git commit -m 'Stage non-mutating VDN runtime bypass'
+          git push

@@ -265,9 +265,9 @@ class ApplyVDNH3:
             "lora_mode": (["merge", "bypass"], {
                 "default": "merge",
                 "tooltip": "merge uses normal Comfy weight patches. bypass uses "
-                           "VDN-owned PyTorch forward post-hooks for ordinary LoRA "
-                           "targets: module.forward is never replaced or spliced, and "
-                           "other runtime-bypass providers keep independent ownership."}),
+                           "VDN-owned PyTorch forward post-hooks, pre-stages runtime "
+                           "factors before H3 execution, and leaves pruned curve AdaLN "
+                           "base weights untouched; fused INT8 fc2 remains native."}),
             "branch_weights": (["auto", "stream", "resident"], {
                 "default": "auto",
                 "tooltip": "auto: resident BF16 when the base-reserved VRAM budget "
@@ -320,8 +320,8 @@ class ApplyVDNH3Advanced:
             "lora_mode": (["merge", "bypass"], {
                 "default": "merge",
                 "tooltip": "bypass uses VDN-owned PyTorch forward post-hooks and "
-                           "never replaces module.forward; fused INT8 fc2 and projected "
-                           "curve AdaLN terms remain native Comfy patches."}),
+                           "never replaces module.forward or materializes projected "
+                           "curve AdaLN base weights; fused INT8 fc2 stays native."}),
             "branch_weights": (["auto", "stream", "resident"], {"default": "auto"}),
             "retain_buffers": (["auto", "on", "off"], {"default": "auto"}),
             "verbose": ("BOOLEAN", {"default": False}),

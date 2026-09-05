@@ -170,7 +170,15 @@ def _build_window_plan(video_start, video_end, num_frames, tokens_per_frame,
 def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
                                    num_frames, tokens_per_frame, bounds, scale,
                                    anchor_frames="none", transformer_options=None):
-    """Grouped exact window softmax with execution-owned plan/KV scratch reuse."""
+    """Grouped exact window softmax with execution-owned plan/KV scratch reuse.
+
+    The argument is retained for call/API compatibility, but model-level attention
+    overrides must not enter the VDN local windows. v1.3.1 and upstream v1.4.x kept
+    these windows on exact SDPA even when the surrounding H3 model used Sage/Kitchen
+    overrides. PR #2 accidentally propagated ``transformer_options`` through this
+    new retained helper, changing the trained hybrid operator on such models.
+    """
+    del transformer_options
     heads, head_dim = query.shape[1], query.shape[2]
     seq = query.shape[0]
     resources = current_runtime_buffers()
@@ -194,7 +202,7 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
     global_count = global_idx.numel()
     if global_count:
         out[global_idx] = W._sdpa(
-            query[global_idx], key, value, scale, transformer_options)
+            query[global_idx], key, value, scale, None)
 
     groups = plan["groups"]
     if groups:
@@ -222,10 +230,10 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
                 k_scratch[:global_count + window_rows],
                 v_scratch[:global_count + window_rows],
                 scale,
-                transformer_options,
+                None,
             )
 
     for start, stop in plan["anchor_slices"]:
         out[start:stop] = W._sdpa(
-            query[start:stop], key, value, scale, transformer_options)
+            query[start:stop], key, value, scale, None)
     return out

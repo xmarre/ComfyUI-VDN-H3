@@ -10,6 +10,7 @@ on:
 jobs:
   publish-node:
     name: Publish Node
+    if: ${{ github.repository_owner == 'Saganaki22' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

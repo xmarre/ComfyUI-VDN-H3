@@ -10,11 +10,11 @@ from vdn_h3.apply import apply_adapters
 
 
 class QuantizedLikeLinear(nn.Module):
-    """Synthetic custom-weight module for merge and activation-bypass lifecycles.
+    """Synthetic custom-weight module for merge and non-mutating runtime-bypass lifecycles.
 
     ``convert_weight`` / ``set_weight`` stand in for dequantize/requantize in the
     eager merge path. ``weight_function`` remains present specifically so the
-    bypass regression can assert that v1.5.1 no longer installs a weight wrapper
+    bypass regression can assert that the runtime path installs neither a weight wrapper nor a forward replacement
     or forces this custom-weight module onto that path.
     """
 
@@ -147,7 +147,7 @@ def test_bypass_custom_weight_preserves_native_weight_path():
         assert module.set_calls == 0
         assert torch.equal(module.weight, base_weight)
         assert len(module.weight_function) == 0
-        assert module.forward != true_forward
+        assert module.forward == true_forward
 
         x = torch.randn(4, 8)
         expected = F.linear(x, base_weight) + F.linear(F.linear(x, a), b)
@@ -182,7 +182,7 @@ def test_bypass_repeated_custom_weight_clone_cycles_do_not_accumulate():
         clone.patch_model(device_to=torch.device("cpu"))
         try:
             assert len(module.weight_function) == 0, cycle
-            assert module.forward != true_forward, cycle
+            assert module.forward == true_forward, cycle
             assert torch.allclose(module(x), expected, atol=2e-6, rtol=2e-6), cycle
             assert torch.equal(module.weight, base_weight), cycle
         finally:

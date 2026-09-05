@@ -2,27 +2,33 @@
 
 ``merge`` uses normal ``ModelPatcher.add_patches`` weight ownership.
 
-``bypass`` keeps the workflow-facing low-residency mode but deliberately uses
-ComfyUI's activation-side ``BypassForwardHook`` contract for ordinary LoRA
-targets. The hooks are installed through a stack-safe VDN injection that keeps
-VDN inside any independently managed Comfy bypass chain and can splice VDN back
-out without restoring stale ``module.forward`` objects.
+``bypass`` is the low-residency execution mode. Ordinary VDN LoRA terms are
+implemented with PyTorch forward *post-hooks*, not Comfy ``BypassForwardHook``
+and not ``ModelPatcher.weight_function``. VDN therefore never replaces or
+splices ``module.forward`` and cannot participate in another provider's mutable
+forward-wrapper linked list.
 
-This is intentional for quantized MiniMax-H3 bases: using a ModelPatcher
-``weight_function`` on those layers forces Comfy's dequantized weight path. In
-the real stacked VDN + external runtime-DoRA workflow that v1.5.0 path regressed
-into a CUDA illegal-memory-access abort. The stack-safe hook path preserves the
-native quantized base forward and is the path previously validated with the same
-cross-provider Continuum lifecycle.
+This split is deliberate for quantized MiniMax-H3. The v1.5.0 weight-wrapper
+path forced custom quantized layers through a copied/dequantized weight path and
+hard-aborted in the production stacked-adapter workflow. v1.5.1 restored the old
+mutable-forward bypass chain, but the same real RTX PRO 6000 workflow still
+hard-aborted at the first H3 evaluation. VDN now stays out of both mechanisms:
+the native quantized base forward runs unchanged, an independently managed Comfy
+runtime adapter may wrap that forward if it wants to, and VDN adds its exact
+low-rank residual after the module returns.
 
-Full-width AdaLN LoRAs on a curve/pruned H3 base are projected once through the
-exact pruning affine (basis + mean). Their projected native curve weight and
-constant bias terms stay under ordinary Comfy weight-patch ownership even in
-``bypass`` mode; no dense timestep MLP reconstruction is used.
+Fused INT8 ``mlp.fc2`` targets whose H3 fast path bypasses ``module.forward``
+remain ordinary Comfy weight patches. Full-width AdaLN LoRAs on curve/pruned H3
+bases remain projected once through the exact pruning affine (basis + mean), with
+the resulting native curve weight and constant-bias terms owned by normal Comfy
+patches in both modes.
 """
 from __future__ import annotations
 
 import logging
+import threading
+import weakref
+from collections import defaultdict
 
 import torch
 import torch.nn.functional as F
@@ -30,7 +36,6 @@ import torch.nn.functional as F
 import comfy.lora
 import comfy.patcher_extension
 import comfy.utils
-import comfy.weight_adapter
 
 from vdn_h3.curve_affine import find_curve_affine, project_curve_terms
 
@@ -141,31 +146,12 @@ def _native_patch_projected_curve(new_model, terms_by_module, bias_terms_by_modu
     return weight_patches, bias_patches
 
 
-class _FrugalLoRA(comfy.weight_adapter.LoRAAdapter):
-    """Activation-side LoRA used by VDN's stack-safe bypass path."""
-
-    def bypass_forward(self, org_forward, x, *args, **kwargs):
-        base_out = org_forward(x, *args, **kwargs)
-        if getattr(self, "is_conv", False):
-            return super().bypass_forward(org_forward, x, *args, **kwargs)
-
-        up, down, alpha = self.weights[0], self.weights[1], self.weights[2]
-        rank = down.shape[0]
-        scale = (
-            (alpha / rank if alpha is not None else 1.0)
-            * getattr(self, "multiplier", 1.0)
-        )
-        down = down.to(dtype=x.dtype)
-        up = up.to(dtype=x.dtype)
-        return base_out.add_(F.linear(F.linear(x, down), up), alpha=scale)
-
-
 def _int8_fused_fc2(dm, modules):
     """Return fc2 targets whose fused quantized forward bypasses module.forward.
 
-    These targets cannot use an activation-side hook because H3's fused path reads
-    the underlying linear weight directly. Keep them under normal Comfy weight
-    patching, matching the previously validated PR #1 behavior.
+    A PyTorch forward hook cannot observe these H3 fused calls. Keep these terms
+    under normal Comfy weight-patch ownership, matching the previously validated
+    quantized path.
     """
     fused = []
     for module in modules:
@@ -183,167 +169,145 @@ def _int8_fused_fc2(dm, modules):
     return fused
 
 
-def _bypass(new_model, converted, modules, strength, hooks):
-    if not modules:
-        return 0
-    subset = {module: converted[module] for module in modules}
-    loaded, key_map = _load_comfy_adapter(new_model, subset)
+class _PostForwardLoRA:
+    """Exact additive LoRA residual without replacing ``module.forward``.
 
-    manager = comfy.weight_adapter.BypassInjectionManager()
-    installed = 0
-    for module in modules:
-        key = key_map[module]
-        adapter = loaded.get(key)
-        if adapter is None:
-            continue
-        if isinstance(adapter, comfy.weight_adapter.LoRAAdapter):
-            adapter = _FrugalLoRA(adapter.loaded_keys, adapter.weights)
-        elif not isinstance(adapter, comfy.weight_adapter.WeightAdapterBase):
-            raise RuntimeError(
-                f"VDN bypass target {key} produced unsupported adapter "
-                f"{type(adapter).__name__}"
-            )
-        manager.add_adapter(key, adapter, strength=float(strength))
-        installed += 1
+    All terms for one module are fused into one down/up pair per active
+    device/dtype. Source tensors stay in their checkpoint-owned representation;
+    device copies are cached only while the PatcherInjection is active and are
+    dropped on eject/replacement.
+    """
 
-    manager.create_injections(new_model.model)
-    hooks.extend(manager.hooks)
-    if len(manager.hooks) != installed:
-        raise RuntimeError(
-            f"VDN bypass created {len(manager.hooks)} hooks for {installed} adapters"
+    def __init__(self, terms):
+        self.terms = tuple(
+            (down.detach(), up.detach(), float(scale))
+            for down, up, scale in terms
         )
-    return installed
+        self._cache = {}
 
+    def _compiled_weights(self, x: torch.Tensor):
+        key = (x.device.type, x.device.index, x.dtype)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
 
-def _same_bound_method(left, right):
-    """Identity check stable across repeated bound-method attribute reads."""
-    if left is right:
-        return True
-    left_self = getattr(left, "__self__", None)
-    right_self = getattr(right, "__self__", None)
-    left_func = getattr(left, "__func__", None)
-    right_func = getattr(right, "__func__", None)
-    return (
-        left_self is right_self
-        and left_func is not None
-        and left_func is right_func
-    )
+        downs = []
+        ups = []
+        for down, up, scale in self.terms:
+            down_active = down.to(device=x.device, dtype=x.dtype, non_blocking=True)
+            up_active = up.to(device=x.device, dtype=x.dtype, non_blocking=True)
+            if scale != 1.0:
+                up_active = up_active * scale
+            downs.append(down_active)
+            ups.append(up_active)
 
+        if not downs:
+            raise RuntimeError("VDN post-forward LoRA hook has no adapter terms")
+        down_cat = downs[0] if len(downs) == 1 else torch.cat(downs, dim=0)
+        up_cat = ups[0] if len(ups) == 1 else torch.cat(ups, dim=1)
+        self._cache[key] = (down_cat, up_cat)
+        return down_cat, up_cat
 
-def _bypass_hook_owner(forward):
-    """Return the Comfy bypass hook owning a bound forward, if there is one."""
-    hook_type = getattr(comfy.weight_adapter, "BypassForwardHook", None)
-    owner = getattr(forward, "__self__", None)
-    if isinstance(hook_type, type) and isinstance(owner, hook_type):
-        return owner
-    return None
-
-
-def _inject_hook_stack_safe(hook):
-    """Inject VDN below any already-active Comfy bypass-hook chain."""
-    if getattr(hook, "original_forward", None) is not None:
-        return
-
-    module = hook.module
-    previous_forward = module.forward
-    hook.inject()  # lets Comfy set adapter metadata/device placement
-
-    outer = _bypass_hook_owner(previous_forward)
-    if outer is None:
-        return
-
-    current = outer
-    seen = set()
-    while True:
-        marker = id(current)
-        if marker in seen:
-            module.forward = previous_forward
-            hook.original_forward = None
-            raise RuntimeError("VDN found a cyclic Comfy bypass-forward chain")
-        seen.add(marker)
-
-        inner_forward = getattr(current, "original_forward", None)
-        inner = _bypass_hook_owner(inner_forward)
-        if inner is None:
-            break
-        current = inner
-
-    # hook.inject() temporarily made VDN outermost. Restore the existing chain,
-    # then splice VDN immediately above its true/base forward instead.
-    module.forward = previous_forward
-    hook.original_forward = inner_forward
-    current.original_forward = hook._bypass_forward
-
-
-def _eject_hook_stack_safe(hook):
-    """Remove a VDN hook even when another Comfy bypass hook still wraps it."""
-    original_forward = getattr(hook, "original_forward", None)
-    if original_forward is None:
-        return
-
-    module = hook.module
-    target = hook._bypass_forward
-    current_forward = module.forward
-
-    if _same_bound_method(current_forward, target):
-        module.forward = original_forward
-        hook.original_forward = None
-        return
-
-    current = _bypass_hook_owner(current_forward)
-    seen = set()
-    while current is not None:
-        marker = id(current)
-        if marker in seen:
+    def __call__(self, module, inputs, output):
+        if not isinstance(output, torch.Tensor):
             raise RuntimeError(
-                "VDN found a cyclic Comfy bypass-forward chain during eject"
+                f"VDN post-forward bypass expected Tensor output from "
+                f"{type(module).__name__}, got {type(output).__name__}"
             )
-        seen.add(marker)
+        if not inputs or not isinstance(inputs[0], torch.Tensor):
+            raise RuntimeError(
+                f"VDN post-forward bypass expected the first positional input to "
+                f"{type(module).__name__} to be a Tensor"
+            )
+        x = inputs[0]
+        down, up = self._compiled_weights(x)
+        delta = F.linear(F.linear(x, down), up)
+        return output + delta
 
-        inner_forward = getattr(current, "original_forward", None)
-        if _same_bound_method(inner_forward, target):
-            current.original_forward = original_forward
-            hook.original_forward = None
-            return
-        current = _bypass_hook_owner(inner_forward)
-
-    # Another provider may already have detached this hook. Never resurrect a
-    # stale original over the currently valid live chain.
-    hook.original_forward = None
+    def clear(self):
+        self._cache.clear()
 
 
-def _install_injection(new_model, hooks):
-    """Install one clone- and cross-provider-safe VDN bypass injection."""
-    if not hooks:
-        return
+# ModelPatcher clones share the same inner model. Track the currently active VDN
+# registration outside the model object so a newer clone can replace an older
+# registration without private attributes on the model and so an old clone's
+# later eject cannot tear down the newer generation.
+_ACTIVE_POST_FORWARD = weakref.WeakKeyDictionary()
+_ACTIVE_POST_FORWARD_LOCK = threading.RLock()
 
-    owner = new_model.model  # clone-shared inner model
+
+def _remove_post_forward_registration(registration):
+    for handle in reversed(registration["handles"]):
+        handle.remove()
+    for plan in registration["plans"]:
+        plan.clear()
+
+
+def _install_post_forward_injection(new_model, dm, terms_by_module):
+    if not terms_by_module:
+        return 0
+
+    plans = []
+    for path in sorted(terms_by_module):
+        module = comfy.utils.get_attr(dm, path)
+        register = getattr(module, "register_forward_hook", None)
+        if not callable(register):
+            raise RuntimeError(
+                f"VDN bypass target {path!r} ({type(module).__name__}) does not "
+                "support PyTorch forward hooks"
+            )
+        plans.append((path, module, _PostForwardLoRA(terms_by_module[path])))
+
+    owner = new_model.model
+    token = object()
 
     def inject_all(model_patcher):
-        old = getattr(owner, "_vdn_live_hooks", None)
-        if old:
-            for hook in reversed(old):
-                _eject_hook_stack_safe(hook)
-        try:
-            for hook in hooks:
-                _inject_hook_stack_safe(hook)
-        except Exception:
-            for hook in reversed(hooks):
-                _eject_hook_stack_safe(hook)
-            raise
-        owner._vdn_live_hooks = hooks
+        del model_patcher
+        with _ACTIVE_POST_FORWARD_LOCK:
+            current = _ACTIVE_POST_FORWARD.get(owner)
+            if current is not None and current["token"] is token:
+                return
+            if current is not None:
+                _remove_post_forward_registration(current)
+
+            handles = []
+            hook_plans = [plan for _, _, plan in plans]
+            try:
+                for _, module, plan in plans:
+                    handles.append(module.register_forward_hook(plan))
+            except Exception:
+                for handle in reversed(handles):
+                    handle.remove()
+                for plan in hook_plans:
+                    plan.clear()
+                raise
+
+            _ACTIVE_POST_FORWARD[owner] = {
+                "token": token,
+                "handles": handles,
+                "plans": hook_plans,
+            }
 
     def eject_all(model_patcher):
-        for hook in reversed(hooks):
-            _eject_hook_stack_safe(hook)
-        if getattr(owner, "_vdn_live_hooks", None) is hooks:
-            owner._vdn_live_hooks = None
+        del model_patcher
+        with _ACTIVE_POST_FORWARD_LOCK:
+            current = _ACTIVE_POST_FORWARD.get(owner)
+            # A newer clone may already have replaced this registration. An old
+            # eject must not remove the newer generation.
+            if current is None or current["token"] is not token:
+                return
+            _remove_post_forward_registration(current)
+            try:
+                del _ACTIVE_POST_FORWARD[owner]
+            except KeyError:
+                pass
 
     injection = comfy.patcher_extension.PatcherInjection(
         inject=inject_all,
         eject=eject_all,
     )
     new_model.set_injections("vdn_lora", [injection])
+    return len(plans)
 
 
 def apply_adapters(
@@ -354,7 +318,7 @@ def apply_adapters(
     stage_path=None,
     verbose=False,
 ):
-    """Apply released VDN adapters through merge or stack-safe bypass mode."""
+    """Apply released VDN adapters through merge or forward-post-hook bypass."""
     if mode not in ("merge", "bypass"):
         raise ValueError(
             f"VDN lora_mode must be 'merge' or 'bypass', got {mode!r}"
@@ -365,7 +329,7 @@ def apply_adapters(
     pruned = _is_pruned_base(dm)
     report = {}
     curve_terms = {}
-    all_hooks = []
+    runtime_terms = defaultdict(list)
 
     for name, converted in converted_by_name.items():
         s = float(per_name.get(name, 1.0) if per_name is not None else strength)
@@ -393,13 +357,12 @@ def apply_adapters(
             bypass_modules = [module for module in modules if module not in fused]
             fused_terms = {module: ordinary[module] for module in sorted(fused)}
 
-            bypass_targets = _bypass(
-                new_model,
-                ordinary,
-                bypass_modules,
-                s,
-                all_hooks,
-            )
+            for module in bypass_modules:
+                down, up, term_scale = ordinary[module]
+                runtime_terms[module].append(
+                    (down, up, float(term_scale) * s)
+                )
+            bypass_targets = len(bypass_modules)
             if fused_terms:
                 fused_native_targets = _native_patch_adapter(
                     new_model, fused_terms, s
@@ -418,7 +381,7 @@ def apply_adapters(
         }
         if verbose:
             _log.info(
-                "[vdn] adapter %s: %d native patches, %d stack-safe bypass targets, "
+                "[vdn] adapter %s: %d native patches, %d post-forward bypass targets, "
                 "%d fused-native targets, %d curve AdaLN",
                 name,
                 native_patches,
@@ -468,10 +431,17 @@ def apply_adapters(
         )
 
     if mode == "bypass":
-        _install_injection(new_model, all_hooks)
+        forward_hook_modules = _install_post_forward_injection(
+            new_model, dm, runtime_terms
+        )
+        runtime_term_count = sum(len(terms) for terms in runtime_terms.values())
         runtime_report = {
-            "mode": "stack_safe_bypass",
-            "forward_hooks": len(all_hooks),
+            "mode": "post_forward_hook_bypass",
+            "forward_hooks": forward_hook_modules,
+            "pytorch_forward_post_hooks": forward_hook_modules,
+            "runtime_terms": runtime_term_count,
+            "mutable_forward_wrappers": 0,
+            "module_forward_untouched": True,
             "weight_wrappers": 0,
             "bias_wrappers": 0,
             "managed_adapter_bytes": 0,

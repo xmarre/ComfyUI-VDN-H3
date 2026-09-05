@@ -36,6 +36,23 @@ _ACTIVE_BUFFERS = contextvars.ContextVar("vdn_active_runtime_buffers", default=N
 # each RuntimeBuffers owns at most one Future/result and drops it on reset.
 _PREFETCH_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="vdn-branch-prefetch")
+_RECORD_STREAM_NEEDED = None
+
+
+def _record_stream_needed():
+    """Return whether explicit record_stream ownership is required.
+
+    PyTorch's cudaMallocAsync allocator is stream ordered already; record_stream
+    is a no-op there and current PyTorch warns when it is called on a tensor
+    created on the same stream. Cache the allocator decision for this process.
+    """
+    global _RECORD_STREAM_NEEDED
+    if _RECORD_STREAM_NEEDED is None:
+        try:
+            _RECORD_STREAM_NEEDED = torch.cuda.get_allocator_backend() != "cudaMallocAsync"
+        except Exception:
+            _RECORD_STREAM_NEEDED = True
+    return bool(_RECORD_STREAM_NEEDED)
 
 
 def current_runtime_buffers():
@@ -63,6 +80,8 @@ class _StreamPrefetcher:
 
     @staticmethod
     def _record_stream(tensor, stream):
+        if not _record_stream_needed():
+            return
         seen = [tensor]
         inner = getattr(tensor, "_qdata", None)
         if isinstance(inner, torch.Tensor):

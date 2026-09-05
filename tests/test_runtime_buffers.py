@@ -224,3 +224,43 @@ def test_completed_prefetch_is_retained_for_its_target(monkeypatch):
     assert prefetcher._index == "original"
     prefetcher.reset()
     assert prefetcher._future is None
+
+
+def test_stream_prefetch_skips_record_stream_under_cuda_malloc_async(monkeypatch):
+    from vdn_h3 import runtime
+
+    class FakeTensor:
+        def __init__(self):
+            self.calls = 0
+
+        def record_stream(self, _stream):
+            self.calls += 1
+
+    fake = FakeTensor()
+    monkeypatch.setattr(torch.cuda, "get_allocator_backend", lambda: "cudaMallocAsync")
+    monkeypatch.setattr(runtime, "_RECORD_STREAM_NEEDED", None)
+
+    runtime._StreamPrefetcher._record_stream(fake, object())
+
+    assert fake.calls == 0
+    assert runtime._RECORD_STREAM_NEEDED is False
+
+
+def test_stream_prefetch_records_stream_for_non_async_allocator(monkeypatch):
+    from vdn_h3 import runtime
+
+    class FakeTensor:
+        def __init__(self):
+            self.calls = 0
+
+        def record_stream(self, _stream):
+            self.calls += 1
+
+    fake = FakeTensor()
+    monkeypatch.setattr(torch.cuda, "get_allocator_backend", lambda: "native")
+    monkeypatch.setattr(runtime, "_RECORD_STREAM_NEEDED", None)
+
+    runtime._StreamPrefetcher._record_stream(fake, object())
+
+    assert fake.calls == 1
+    assert runtime._RECORD_STREAM_NEEDED is True

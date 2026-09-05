@@ -10,9 +10,9 @@ those invariants.
 Audited upstream head:
 
 - repository: `Saganaki22/ComfyUI-VDN-H3`
-- head: `fe6e6f2f26075f03dea09b5216e14db727af4b77`
+- head: `b49130c26a70d12c542601c5bc4f7ee0f112ee2e`
 - prior snapshot already reconciled by this PR: `e49edae28266bcaa9b74988ac95ef4dd035f959c`
-- delta: 9 upstream commits
+- delta: 10 upstream commits
 
 ### Commit-by-commit disposition
 
@@ -27,6 +27,7 @@ Audited upstream head:
 | `dbc94d5e045d6766a47e7ef12dc19dc029b79694` | Fix compiler-stack detector | Adopted: detection follows the final upstream `comfy_aimdo.malloc_graph` stack shape. |
 | `4478aa462e185282da380f9a1c6224bfc35a469c` | Fix import shadowing in compiler shim | Not reproduced: the fork guard uses module-level imports/lazy module lookup without the shadowing pattern. |
 | `fe6e6f2f26075f03dea09b5216e14db727af4b77` | Scope compiler disable to VDN forwards and remove unload hook | Adopted and hardened. |
+| `b49130c26a70d12c542601c5bc4f7ee0f112ee2e` | Skip `record_stream` under `cudaMallocAsync` | Adopted in the fork-owned `vdn_h3.runtime` prefetcher. The fork moved lookahead ownership out of upstream `hybrid.py`, so the allocator guard is applied at the equivalent state-owned runtime boundary. |
 
 ## Compiler guard adaptation
 
@@ -76,6 +77,9 @@ final tree:
 1. pinned Comfy + pinned OpenVDN direct numerical/orchestration oracle;
 2. current Comfy `master` import/node-registration smoke.
 
-Production GPU validation remains a separate gate and must still exercise the
-AIMDO-era Comfy build with VDN, Continuum, Spectrum and the Flow target-sparse
-external-sequence contract.
+The production GPU gate has now exercised the AIMDO-era Comfy build with VDN,
+Continuum, Spectrum, DiffAid, Untwisting RoPE, runtime LoRA bypass, streamed
+INT8-ConvRot branch weights, retained buffers, and Flow external-sequence API 2
+across multi-boundary mixed-grid continuation. The allocator guard additionally
+matches current upstream `b49130c...` and removes the observed no-op warning under
+`cudaMallocAsync`.

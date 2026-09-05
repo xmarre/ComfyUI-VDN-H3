@@ -83,9 +83,6 @@ def _effective_free_vram(model):
         loaded_size = int(model.loaded_size())
         remaining = max(0, model_size - loaded_size)
     except Exception as exc:
-        # Current and pinned Comfy expose both methods. If an older/custom patcher
-        # does not, do not invent a model-size estimate; explicit stream/off remains
-        # available and the current compatibility smoke will catch core API drift.
         _log.warning(
             "[vdn] could not reserve unloaded MODEL bytes for auto VRAM policy (%s); "
             "using raw free-memory reading", exc)
@@ -103,8 +100,6 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
     if lora_mode not in ("merge", "bypass"):
         raise ValueError(f"lora_mode must be merge or bypass, got {lora_mode!r}")
     if branch_weights == "cache_gpu":
-        # Serialized v1.3/v1.4 workflows used this name. The safe equivalent is a
-        # Comfy-owned resident additional model, not VDN's former private GPU cache.
         _log.warning("[vdn] branch_weights=cache_gpu is deprecated; using resident")
         branch_weights = "resident"
     if branch_weights not in ("auto", "stream", "resident"):
@@ -269,9 +264,10 @@ class ApplyVDNH3:
                 "tooltip": "Adapter strength. 1.0 is the released checkpoint setting."}),
             "lora_mode": (["merge", "bypass"], {
                 "default": "merge",
-                "tooltip": "merge uses normal Comfy weight patches. bypass is the "
-                           "low-VRAM runtime mode: Comfy weight_function wrappers apply "
-                           "the LoRA per layer without VDN touching module.forward."}),
+                "tooltip": "merge uses normal Comfy weight patches. bypass uses "
+                           "stack-safe Comfy BypassForwardHook adapters for ordinary "
+                           "targets, preserving native quantized forwards while safely "
+                           "stacking with other runtime bypass providers."}),
             "branch_weights": (["auto", "stream", "resident"], {
                 "default": "auto",
                 "tooltip": "auto: resident BF16 when the base-reserved VRAM budget "
@@ -323,8 +319,9 @@ class ApplyVDNH3Advanced:
                 "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
             "lora_mode": (["merge", "bypass"], {
                 "default": "merge",
-                "tooltip": "bypass uses the safe runtime low-VRAM weight-wrapper path; "
-                           "it does not install forward hooks/chains."}),
+                "tooltip": "bypass uses VDN's stack-safe Comfy bypass-hook lifecycle "
+                           "for ordinary LoRA targets; projected curve AdaLN remains "
+                           "under normal native weight/bias patches."}),
             "branch_weights": (["auto", "stream", "resident"], {"default": "auto"}),
             "retain_buffers": (["auto", "on", "off"], {"default": "auto"}),
             "verbose": ("BOOLEAN", {"default": False}),

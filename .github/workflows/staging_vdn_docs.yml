@@ -1,0 +1,75 @@
+name: staging VDN v1.5 docs
+
+on:
+  push:
+    branches: [staging/release-v1.5.0-20260905]
+
+permissions:
+  contents: write
+
+jobs:
+  update-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          ref: staging/release-v1.5.0-20260905
+      - name: Update release-facing docs
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              if text.count(old) != 1:
+                  raise SystemExit(f"{path}: expected one match for {old!r}, got {text.count(old)}")
+              p.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              "README.md",
+              "A ComfyUI port of the released [OpenVDN VDN-H3](https://github.com/OpenVDN/vdn-minimax-h3) hybrid-attention architecture for ComfyUI's native MiniMax-H3 model.\n",
+              "A ComfyUI port of the released [OpenVDN VDN-H3](https://github.com/OpenVDN/vdn-minimax-h3) hybrid-attention architecture for ComfyUI's native MiniMax-H3 model. This xmarre fork tracks the original [Saganaki22 ComfyUI port](https://github.com/Saganaki22/ComfyUI-VDN-H3) while adding stricter Comfy lifecycle ownership and the external-sequence API 2 used by Flow-Aligned Regenerate mixed-grid Continuum.\n\n**v1.5.0 status:** the API 2 path, streamed INT8-ConvRot branch, retained buffers, runtime LoRA bypass, grouped attention, AIMDO compiler guard, Spectrum/DiffAid/Untwist composition and multi-boundary Continuum execution were validated together on an RTX Pro 6000. The Flow-side one-token suffix DC bridge removed the remaining visible handoff flash. This does not turn unrelated Advanced-node ablations into validated defaults.\n",
+          )
+          replace_once(
+              "README.md",
+              "git clone https://github.com/Saganaki22/ComfyUI-VDN-H3\n",
+              "git clone https://github.com/xmarre/ComfyUI-VDN-H3\n",
+          )
+          replace_once(
+              "README.md",
+              "Until matched GPU renders are complete, use `merge` as the Stage-DMD reference path and treat runtime `bypass` as a low-VRAM path requiring real-render validation.\n",
+              "The integrated RTX Pro 6000 mixed-grid Continuum validation completed successfully with runtime `bypass`. `merge` remains the conservative numerical reference when isolating adapter behavior, and other bases/strengths/backends should not be assumed equivalent without their own comparison.\n",
+          )
+          replace_once(
+              "README.md",
+              "CPU tests require retained and transient scan/window/complete-linear-branch paths to match the reference path exactly. Real CUDA allocation and speed still require production GPU validation.\n",
+              "CPU tests require retained and transient scan/window/complete-linear-branch paths to match the reference path exactly. The released v1.5.0 integrated CUDA path has also been exercised with `branch_weights=auto` resolving to streamed INT8-ConvRot and `retain_buffers=auto` resolving to retained buffers; this is an interoperability validation, not a universal speed claim.\n",
+          )
+          replace_once(
+              "README_ZH.md",
+              "这是 [OpenVDN VDN-H3](https://github.com/OpenVDN/vdn-minimax-h3) 发布版混合注意力架构在 ComfyUI 原生 MiniMax-H3 模型上的移植。\n",
+              "这是 [OpenVDN VDN-H3](https://github.com/OpenVDN/vdn-minimax-h3) 发布版混合注意力架构在 ComfyUI 原生 MiniMax-H3 模型上的移植。xmarre fork 继续跟踪原始 [Saganaki22 ComfyUI 移植](https://github.com/Saganaki22/ComfyUI-VDN-H3)，并加入更严格的 Comfy 生命周期所有权以及 Flow-Aligned Regenerate mixed-grid Continuum 使用的 external-sequence API 2。\n\n**v1.5.0 状态：** API 2、streamed INT8-ConvRot branch、retained buffers、runtime LoRA bypass、grouped attention、AIMDO compiler guard、Spectrum/DiffAid/Untwist 组合以及多边界 Continuum 已在 RTX Pro 6000 上完成集成验证。Flow 侧单 token suffix DC bridge 消除了剩余的可见 handoff 闪烁。这不代表 Advanced 节点中的其他消融设置自动成为已验证默认值。\n",
+          )
+          replace_once(
+              "README_ZH.md",
+              "git clone https://github.com/Saganaki22/ComfyUI-VDN-H3\n",
+              "git clone https://github.com/xmarre/ComfyUI-VDN-H3\n",
+          )
+          replace_once(
+              "README_ZH.md",
+              "历史 bypass 测试使用的是旧 activation-level forward-hook 实现，不能代表新的 weight-level runtime 路径。完成匹配 GPU render 前，Stage-DMD 质量对照仍以 `merge` 为 reference。\n",
+              "历史 bypass 测试使用的是旧 activation-level forward-hook 实现，不能代表新的 weight-level runtime 路径。v1.5.0 的 RTX Pro 6000 mixed-grid Continuum 集成验证已成功使用新的 runtime `bypass`；在单独隔离 adapter 数值行为时，`merge` 仍是保守 reference。\n",
+          )
+          PY
+      - name: Validate docs and push
+        shell: bash
+        run: |
+          git diff --check
+          git config user.name xmarre
+          git config user.email 54859656+xmarre@users.noreply.github.com
+          git add README.md README_ZH.md
+          git commit -m "Update VDN-H3 v1.5.0 validation documentation"
+          git push origin HEAD:staging/release-v1.5.0-20260905

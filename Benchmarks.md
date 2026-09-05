@@ -1,25 +1,27 @@
 # Benchmarks — ComfyUI-VDN-H3
 
-This file preserves historical measurements and defines the measurement contract for the current runtime. **Historical numbers are not performance validation of v1.5.1.**
+This file preserves historical measurements and defines the measurement contract for the current runtime. **Historical numbers are not performance validation of v1.5.2.**
 
-## Current v1.5.1 execution differences
+## Current v1.5.2 execution differences
 
 Compared with the older measurements below:
 
-- `lora_mode=bypass` uses stack-safe activation-side Comfy `BypassForwardHook` adapters for ordinary LoRA targets;
-- the v1.5.0 `add_weight_wrapper()` / `weight_function` adapter path is no longer active;
-- VDN can coexist with another ordinary Comfy runtime-bypass provider on the same module by inserting underneath the existing chain and splicing itself out safely;
+- `lora_mode=bypass` uses one VDN-owned PyTorch forward post-hook per affected ordinary module;
+- VDN never replaces or splices `module.forward`, so another Comfy runtime-bypass provider retains independent ownership of its own forward chain;
+- the v1.5.0 `add_weight_wrapper()` / `weight_function` adapter path is not active;
+- the v1.5.1 VDN `BypassForwardHook` linked-list/splicing path is not active;
+- all VDN LoRA terms for one module are combined into one exact low-rank residual at runtime;
 - fused INT8 `mlp.fc2` targets that do not call `module.forward` remain ordinary Comfy weight patches;
 - full-width curve/pruned AdaLN adapters are projected through the exact pruning affine and applied as native curve weight + bias patches;
-- the old private GPU branch cache is replaced by bounded streaming or a Comfy-managed additional `ModelPatcher`;
-- selected upstream v1.4 performance work is retained under state-owned lifecycle rules: VRAM-aware branch selection, native INT8 ConvRot streaming under pressure, execution-leased retained scratch, and one-block streaming prefetch;
+- the old private GPU branch cache remains replaced by bounded streaming or a Comfy-managed additional `ModelPatcher`;
+- selected upstream v1.4 performance work remains under state-owned lifecycle rules: VRAM-aware branch selection, native INT8 ConvRot streaming under pressure, execution-leased retained scratch, and one-block streaming prefetch;
 - `auto` placement reserves still-unloaded base-model bytes before assigning VDN residency.
 
-New matched GPU measurements are required before assigning speed or VRAM numbers to v1.5.1.
+New matched GPU measurements are required before assigning speed or VRAM numbers to v1.5.2.
 
 ## Historical RTX 5090 measurements
 
-These measurements predate the v1.5/v1.5.1 lifecycle work.
+These measurements predate the v1.5-v1.5.2 lifecycle work.
 
 ### Rig
 
@@ -58,11 +60,9 @@ Normal Comfy `ModelPatcher.add_patches()` application. This is the conservative 
 
 ### `lora_mode=bypass`
 
-Ordinary adapter targets keep the resident base parameter untouched and add their low-rank activation delta through Comfy's bypass-hook mechanism. VDN's injection layer is specifically regression-tested with an independent external runtime-bypass provider in both provider insertion orders and across repeated load/unload cycles.
+Ordinary adapter targets keep the resident base parameter untouched. VDN registers a standard PyTorch forward post-hook and adds the exact low-rank residual after the module returns. VDN does not replace `module.forward`, does not enter another provider's `BypassForwardHook` chain, and does not install a Comfy `weight_function` wrapper.
 
-This path preserves the native base forward for quantized/custom layers instead of installing the v1.5.0 `weight_function` wrapper. That distinction matters because a Comfy weight function on quantized H3 can force a copied/dequantized compute-weight path.
-
-The production reason for the v1.5.1 hotfix was a hard CUDA illegal-address abort in the stacked INT8 ConvRot H3 + VDN bypass + external runtime-DoRA + `cudaMallocAsync` workflow after v1.5.0 introduced runtime weight wrappers. CUDA failure reporting is asynchronous, so that trace does not prove which kernel originally faulted, but the v1.5.0 wrapper path was the new regression boundary and is no longer used.
+The v1.5.0 weight-wrapper design and the v1.5.1 mutable-forward VDN chain both failed the real stacked INT8 ConvRot H3 + external runtime-DoRA + `cudaMallocAsync` workflow at the first H3 evaluation. The latest fatal stack surfaced in core bypass-LoRA execution, but CUDA reporting is asynchronous and therefore does not identify the originating kernel. v1.5.2 treats this as an ownership/topology problem and structurally removes VDN from the shared mutable-forward chain rather than attributing the fault to a specific external hook or CUDA kernel.
 
 ## Curve/pruned AdaLN projection
 
@@ -79,7 +79,7 @@ A_pruned   = A @ basis.T
 bias_delta = B @ (A @ mean)
 ```
 
-The constant term is required. v1.5.1 registers the projected native curve weight and bias terms as ordinary Comfy patches in both adapter modes; there is no reconstructed dense timestep MLP and no runtime weight wrapper for these terms.
+The constant term is required. v1.5.2 registers the projected native curve weight and bias terms as ordinary Comfy patches in both adapter modes; there is no reconstructed dense timestep MLP and no runtime weight wrapper for these terms.
 
 The affine resolver accepts only the exact pruning basis/mean corresponding to the loaded curve table. A mismatched or unverifiable affine fails closed.
 
@@ -122,7 +122,7 @@ CI validates implementation contracts rather than performance:
 - adapter conversion and checkpoint/model-spec validation;
 - curve/pruned affine projection including the constant bias term;
 - merge-path custom/quantized weight lifecycle tests;
-- stack-safe bypass lifecycle tests across independent providers and repeated cycles;
+- non-mutating post-forward bypass lifecycle tests across independent providers and repeated cycles;
 - explicit assertions that active bypass installs no `weight_wrapper_patches`;
 - retained-vs-transient branch/window numerical identity;
 - resource lease/isolation and prefetch placement tests;

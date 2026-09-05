@@ -1,3 +1,29 @@
+# ComfyUI-VDN-H3 v1.5.2
+
+v1.5.2 replaces VDN's mutable-forward runtime bypass after the v1.5.1 hotfix
+still hard-aborted in the real stacked RTX PRO 6000 workflow.
+
+## Runtime-bypass ownership
+
+- Ordinary VDN LoRA residuals use PyTorch forward **post-hooks**.
+- VDN does **not** replace, splice, save, or restore `module.forward`.
+- VDN does **not** use `ModelPatcher.weight_function` / `add_weight_wrapper`.
+- One post-hook is registered per affected module, with all VDN terms fused into
+  one exact low-rank residual for that module.
+- Registration handles are generation-owned across clone-shared models: a newer
+  VDN clone replaces the old registration, while stale ejects cannot remove the
+  newer generation.
+- Independently managed Comfy `BypassForwardHook` providers remain outside VDN's
+  ownership; VDN never enters their mutable forward chain.
+- Fused INT8 `mlp.fc2` and projected curve-AdaLN terms retain native Comfy patch
+  ownership where a module post-hook is not semantically available.
+
+The latest production failure was reported asynchronously at core
+`LoRAAdapter.h` / `BypassForwardHook` during the first actual H3 call, so the
+visible stack does not prove the originating CUDA kernel. This change therefore
+removes the VDN-side shared mutable-forward topology rather than claiming a
+specific CUDA kernel fix. Real GPU validation is required before release.
+
 # ComfyUI-VDN-H3 v1.5.1
 
 v1.5.1 is a hotfix for a production regression introduced by v1.5.0's `lora_mode=bypass` implementation.

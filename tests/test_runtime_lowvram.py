@@ -56,13 +56,17 @@ def test_bypass_apply_uses_injection_and_never_weight_wrappers(monkeypatch):
     assert report["default"]["runtime_bypass_targets"] == 1
     assert report["default"]["runtime_weight_targets"] == 1
     runtime = report["runtime_lowvram"]
-    assert runtime["mode"] == "stack_safe_bypass"
+    assert runtime["mode"] == "post_forward_hook_bypass"
     assert runtime["forward_hooks"] == 1
+    assert runtime["pytorch_forward_post_hooks"] == 1
+    assert runtime["mutable_forward_wrappers"] == 0
+    assert runtime["module_forward_untouched"] is True
     assert runtime["weight_wrappers"] == 0
     assert runtime["bias_wrappers"] == 0
     assert runtime["managed_adapter_bytes"] == 0
     assert runtime["owner_key"] is None
     assert runtime["stack_safe_cross_provider"] is True
+    assert runtime["cross_provider_forward_chain_independent"] is True
 
     x = torch.randn(4, 8)
     base_out = true_forward(x)
@@ -73,6 +77,7 @@ def test_bypass_apply_uses_injection_and_never_weight_wrappers(monkeypatch):
     injection = vdn.injections["vdn_lora"][0]
     injection.inject(vdn)
     try:
+        assert module.forward == true_forward
         got = module(x)
         assert torch.allclose(got, want, atol=1e-5, rtol=1e-5)
     finally:
@@ -103,7 +108,7 @@ def test_bypass_no_longer_requires_weight_function_capability(monkeypatch):
     )
     # Plain nn.Linear deliberately has no Comfy weight_function list. v1.5.0
     # rejected this class because its bypass path depended on add_weight_wrapper;
-    # v1.5.1 must use the activation-side Comfy bypass contract instead.
+    # the VDN runtime path uses a PyTorch post-forward hook instead.
     base = _base_patcher()
     converted, _, _ = _converted()
     vdn = base.clone()

@@ -86,7 +86,7 @@ def test_curve_bypass_uses_native_projected_patches_not_weight_wrappers(tmp_path
     assert weight_key in patcher.patches
     assert bias_key in patcher.patches
     assert patcher.weight_wrapper_patches == {}
-    # Curve-only bypass has nothing to activation-hook; its exact projected
+    # Curve-only bypass has nothing to post-forward-hook; its exact projected
     # native terms are ordinary Comfy weight/bias patches.
     assert patcher.injections == {}
     assert report["runtime_lowvram"]["weight_wrappers"] == 0

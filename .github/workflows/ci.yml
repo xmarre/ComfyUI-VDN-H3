@@ -104,5 +104,17 @@ jobs:
           mod = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(mod)
           assert {'ApplyVDNH3', 'ApplyVDNH3Advanced'} <= set(mod.NODE_CLASS_MAPPINGS)
-          print('node registration: ok')
+
+          # Current Comfy master contains the AIMDO malloc-graph compiler stack that
+          # upstream VDN v1.4.3 guards. Exercise our real detector and restoration
+          # against that checkout rather than relying only on mocked unit coverage.
+          from vdn_h3 import compiler_guard
+          assert compiler_guard._compiler_stack_present()
+          comfy.cli_args.args.disable_comfy_compiler = False
+          with compiler_guard.disabled_for_vdn() as owns:
+              assert owns is True
+              assert comfy.cli_args.args.disable_comfy_compiler is True
+          assert comfy.cli_args.args.disable_comfy_compiler is False
+
+          print('node registration + current compiler guard: ok')
           PY

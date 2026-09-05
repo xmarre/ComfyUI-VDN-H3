@@ -1,23 +1,38 @@
-"""VDN-H3 checkpoint discovery, loading and validation.
+"""VDN-H3 checkpoint discovery, strict ModelSpec validation and bounded resources.
 
-A VDN checkpoint is the official exploded release directory (model_spec.json +
-linear_branch/ + adapters/) from huggingface.co/OpenVDN/vdn-minimax-h3, dropped under
-ComfyUI's models/vdn/ folder. Nothing is converted on disk; tensors are re-keyed in
-memory onto ComfyUI's MiniMax-H3 module paths.
+The released checkpoint directory is consumed in place; tensors are re-keyed only in
+memory.  No ``safe_open`` handle survives a function call.  This is deliberate: an
+indefinite mmap keyed only by path can keep a replaced checkpoint stale and can keep
+the old file mapped on Windows.
 """
+from __future__ import annotations
+
+import hashlib
 import json
 import logging
 import os
+import re
+import struct
+from collections import OrderedDict
+from dataclasses import dataclass
 
 import folder_paths
 import torch
-from safetensors.torch import load_file
+from safetensors import safe_open
 
 _log = logging.getLogger("comfy.vdn")
 
+SPEC_FORMAT_VERSION = 2
+HYBRID_TRANSFORM_VERSION = 2
 SUPPORTED_DELTA_RULES = ("vdn_solve", "sana_scaled", "vdn_scaled")
 SUPPORTED_ANCHORS = ("none", "columns", "rows", "both")
 SHORT_CONV_TARGETS = ("q", "k", "v")
+BRIDGE_VALUES = ("alpha", "none")
+_RUNTIME_KEYS = {
+    "softmax_backend", "rmsnorm_backend", "fp8", "compile",
+    "inference_kernels", "optimized_paths", "w_o_far_scale", "window_decomp",
+    "warmup_steps",
+}
 
 BRANCH_FILE = "model.safetensors"
 BRANCH_FILE_INT8 = "model_int8_convrot_comfyui.safetensors"
@@ -25,13 +40,40 @@ BRANCH_FILE_INT8 = "model_int8_convrot_comfyui.safetensors"
 try:
     from comfy_kitchen.tensor import QuantizedTensor, TensorWiseINT8Layout
     _KITCHEN_OK = True
-except ImportError:  # pragma: no cover - kitchen ships with comfy
+except ImportError:  # pragma: no cover - current Comfy ships comfy-kitchen
     QuantizedTensor = TensorWiseINT8Layout = None
     _KITCHEN_OK = False
 
+SAFETENSORS_DTYPES = {
+    "BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32,
+    "I8": torch.int8, "U8": torch.uint8, "I16": torch.int16,
+    "I32": torch.int32, "I64": torch.int64,
+}
+
+
+@dataclass(frozen=True)
+class FileIdentity:
+    realpath: str
+    mtime_ns: int
+    size: int
+    inode: int | None
+
+
+def file_identity(path: str) -> FileIdentity:
+    real = os.path.realpath(path)
+    st = os.stat(real)
+    return FileIdentity(real, st.st_mtime_ns, st.st_size, getattr(st, "st_ino", None))
+
+
+def _same_identity(expected: FileIdentity):
+    current = file_identity(expected.realpath)
+    if current != expected:
+        raise RuntimeError(
+            f"VDN checkpoint file changed after it was loaded: {expected.realpath}. "
+            "Re-run the Apply VDN node so descriptors are rebuilt from the new file.")
+
 
 def _branch_file(path):
-    """The stage's branch file: plain, or the pre-quantized int8_convrot_comfyui one."""
     plain = os.path.join(path, "linear_branch", BRANCH_FILE)
     if os.path.isfile(plain):
         return plain
@@ -42,90 +84,127 @@ def _branch_file(path):
 
 
 def _read_header(path):
-    """The safetensors JSON header: {key: {"dtype": ..., "shape": [...]}}."""
-    import struct
-    with open(path, "rb") as f:
-        n = struct.unpack("<Q", f.read(8))[0]
-        return json.loads(f.read(n))
+    with open(path, "rb") as fh:
+        raw = fh.read(8)
+        if len(raw) != 8:
+            raise ValueError(f"{path}: truncated safetensors header")
+        size = struct.unpack("<Q", raw)[0]
+        if size <= 0 or size > (64 << 20):
+            raise ValueError(f"{path}: invalid safetensors header size {size}")
+        payload = fh.read(size)
+        if len(payload) != size:
+            raise ValueError(f"{path}: truncated safetensors JSON header")
+        return json.loads(payload)
 
 
-SAFETENSORS_DTYPES = {"BF16": torch.bfloat16, "F16": torch.float16,
-                      "F32": torch.float32, "I8": torch.int8,
-                      "U8": torch.uint8}
-
-# One mmap handle per (file, device). The OS page cache manages residency, so
-# branch weights are read from disk on demand and never accumulated as owned
-# CPU tensors (the same disk-backed philosophy as comfy's --fast-disk).
-_HANDLES = {}
-
-
-def _handle(path, device):
-    h = _HANDLES.get((path, device))
-    if h is None:
-        from safetensors import safe_open
-        h = safe_open(path, framework="pt", device=device)
-        _HANDLES[(path, device)] = h
-    return h
+def _owned_or_transferred(t, device, dtype=None):
+    device = torch.device(device)
+    if device.type == "cpu":
+        out = t.clone()
+        return out if dtype is None or out.dtype == dtype else out.to(dtype=dtype)
+    return t.to(device=device, dtype=dtype or t.dtype)
 
 
 class LazyBranchTensor:
-    """A branch weight kept on disk: reads straight from the safetensors mmap to
-    the target device on resolve(). Per-block stream reads replace the old
-    full-branch load_file() into committed CPU RAM."""
+    """Descriptor for one tensor in a branch safetensors file.
 
-    __slots__ = ("_path", "_key", "_scale_key", "_conf", "shape", "dtype")
+    The descriptor owns no mmap.  ``resolve_branch_weights`` opens the containing file
+    once for the whole block and closes it after every requested tensor has either
+    been cloned to CPU or transferred to the target device.
+    """
+    __slots__ = (
+        "identity", "key", "scale_key", "conf", "shape", "dtype",
+    )
 
-    def __init__(self, path, key, shape, dtype, scale_key=None, conf=None):
-        self._path = path
-        self._key = key
-        self._scale_key = scale_key
-        self._conf = conf
+    def __init__(self, identity, key, shape, dtype, scale_key=None, conf=None):
+        self.identity = identity
+        self.key = key
+        self.scale_key = scale_key
+        self.conf = conf
         self.shape = shape
         self.dtype = dtype
 
-    def resolve(self, device, dtype=None):
-        h = _handle(self._path, str(device))
-        if self._conf is None:
-            t = h.get_tensor(self._key)
-            return t if dtype is None or t.dtype == dtype else t.to(dtype)
-        qdata = h.get_tensor(self._key)
-        scale = h.get_tensor(self._scale_key)
-        return QuantizedTensor(
-            qdata, "TensorWiseINT8Layout",
-            TensorWiseINT8Layout.Params(
-                scale=scale, orig_dtype=dtype or torch.bfloat16,
-                orig_shape=tuple(self.shape), is_weight=True,
-                convrot=bool(self._conf.get("convrot", False)),
-                convrot_groupsize=int(self._conf.get("convrot_groupsize", 256))))
+
+def resolve_branch_weights(weights: dict, device, dtype=None) -> dict:
+    """Resolve a block's descriptors with one bounded safe_open lifetime."""
+    if not weights:
+        return {}
+    descriptors = [v for v in weights.values() if isinstance(v, LazyBranchTensor)]
+    if not descriptors:
+        return {
+            k: (v if dtype is None and v.device == torch.device(device)
+                else v.to(device=device, dtype=dtype or v.dtype))
+            for k, v in weights.items()
+        }
+    identities = {d.identity for d in descriptors}
+    if len(identities) != 1:
+        raise RuntimeError("one VDN branch block unexpectedly spans multiple files")
+    identity = next(iter(identities))
+    _same_identity(identity)
+    out = {}
+    with safe_open(identity.realpath, framework="pt", device="cpu") as handle:
+        for name, desc in weights.items():
+            if not isinstance(desc, LazyBranchTensor):
+                out[name] = desc.to(device=device, dtype=dtype or desc.dtype)
+                continue
+            if desc.conf is None:
+                out[name] = _owned_or_transferred(
+                    handle.get_tensor(desc.key), device, dtype)
+                continue
+            if not _KITCHEN_OK:
+                raise RuntimeError(
+                    "quantized VDN branch requires comfy-kitchen from current ComfyUI")
+            qdata = _owned_or_transferred(handle.get_tensor(desc.key), device)
+            scale = _owned_or_transferred(handle.get_tensor(desc.scale_key), device)
+            out[name] = QuantizedTensor(
+                qdata,
+                "TensorWiseINT8Layout",
+                TensorWiseINT8Layout.Params(
+                    scale=scale,
+                    orig_dtype=dtype or torch.bfloat16,
+                    orig_shape=tuple(desc.shape),
+                    is_weight=True,
+                    convrot=bool(desc.conf.get("convrot", False)),
+                    convrot_groupsize=int(desc.conf.get("convrot_groupsize", 256)),
+                ),
+            )
+    return out
 
 
 def _lazy_branch_sd(path):
-    """Descriptors for every tensor in a branch file, quantization included."""
+    identity = file_identity(path)
     header = _read_header(path)
     conf_keys = [k for k in header if k.endswith(".comfy_quant")]
     confs = {}
     if conf_keys:
-        h = _handle(path, "cpu")
-        for k in conf_keys:
-            layer = k[: -len(".comfy_quant")]
-            confs[layer] = json.loads(
-                bytes(h.get_tensor(k).tolist()).decode("utf-8"))
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            for key in conf_keys:
+                layer = key[: -len(".comfy_quant")]
+                raw = handle.get_tensor(key).clone().tolist()
+                confs[layer] = json.loads(bytes(raw).decode("utf-8"))
+
     out = {}
     for key, meta in header.items():
         if key == "__metadata__" or key.endswith(".comfy_quant"):
             continue
-        if key.endswith(".weight_scale") \
-                and key[: -len(".weight_scale")] in confs:
+        if key.endswith(".weight_scale") and key[: -len(".weight_scale")] in confs:
             continue
         layer = key[: -len(".weight")] if key.endswith(".weight") else None
         conf = confs.get(layer) if layer else None
         scale_key = key + "_scale" if conf else None
         if conf and scale_key not in header:
-            conf = None
-            scale_key = None
+            raise ValueError(f"{path}: quantized tensor {key} is missing {scale_key}")
+        dtype = SAFETENSORS_DTYPES.get(meta["dtype"])
+        if dtype is None:
+            raise ValueError(f"{path}: unsupported safetensors dtype {meta['dtype']} for {key}")
         out[key] = LazyBranchTensor(
-            path, key, torch.Size(meta["shape"]),
-            SAFETENSORS_DTYPES.get(meta["dtype"]), scale_key, conf)
+            identity,
+            key,
+            torch.Size(meta["shape"]),
+            dtype,
+            scale_key,
+            conf,
+        )
     return out
 
 
@@ -141,16 +220,13 @@ def vdn_folders():
 
 
 def list_vdn_checkpoints():
-    """Relative names of directories holding a linear_branch branch file (plain
-    bf16 or pre-quantized int8_convrot_comfyui)."""
     found = []
     for root in vdn_folders():
         if not os.path.isdir(root):
             continue
         for dirpath, dirnames, _files in os.walk(root):
             if os.path.isfile(_branch_file(dirpath)):
-                rel = os.path.relpath(dirpath, root)
-                found.append(rel.replace("\\", "/"))
+                found.append(os.path.relpath(dirpath, root).replace("\\", "/"))
                 dirnames[:] = []
     return sorted(found)
 
@@ -161,113 +237,297 @@ def resolve_vdn_checkpoint(name):
         if os.path.isfile(_branch_file(path)):
             return path
     raise FileNotFoundError(
-        f"VDN checkpoint {name!r} not found under {vdn_folders()}. Download the "
-        "release from huggingface.co/OpenVDN/vdn-minimax-h3 (hf download "
-        "OpenVDN/vdn-minimax-h3 --local-dir <ComfyUI>/models/vdn) and keep the "
-        "stage-... directory layout intact.")
+        f"VDN checkpoint {name!r} not found under {vdn_folders()}. Keep the official "
+        "OpenVDN stage directory layout intact under models/vdn.")
 
 
 def _read_json(path):
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _config_hash(resolved_config):
+    blob = json.dumps(resolved_config, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _require_resolved(value, where):
+    if value is None:
+        raise ValueError(
+            f"{where} is unresolved (null); checkpoint ModelSpec values must be resolved")
+    if isinstance(value, dict):
+        for key, child in value.items():
+            _require_resolved(child, f"{where}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _require_resolved(child, f"{where}[{index}]")
+
+
+def _flat_keys(config):
+    for key, value in config.items():
+        yield key
+        if isinstance(value, dict):
+            yield from _flat_keys(value)
+
+
+def _validate_hybrid(config):
+    lin = config.get("linear_attention")
+    soft = config.get("softmax_attention")
+    if not isinstance(lin, dict) or not isinstance(soft, dict):
+        raise ValueError("hybrid_attention requires linear_attention and softmax_attention objects")
+    if lin.get("delta_rule") not in SUPPORTED_DELTA_RULES:
+        raise ValueError(
+            f"delta_rule {lin.get('delta_rule')!r} not in {SUPPORTED_DELTA_RULES}")
+    if lin.get("bridge") not in BRIDGE_VALUES:
+        raise ValueError(f"bridge {lin.get('bridge')!r} not in {BRIDGE_VALUES}")
+    short = lin.get("short_conv")
+    targets = short.get("targets") if isinstance(short, dict) else None
+    if (not isinstance(targets, list)
+            or len(set(targets)) != len(targets)
+            or any(target not in SHORT_CONV_TARGETS for target in targets)):
+        raise ValueError(
+            f"short_conv must contain a distinct subset of {SHORT_CONV_TARGETS}; got {short!r}")
+    if config.get("anchor_frames") not in SUPPORTED_ANCHORS:
+        raise ValueError(
+            f"anchor_frames {config.get('anchor_frames')!r} not in {SUPPORTED_ANCHORS}")
+    if not isinstance(lin.get("linear_head_dim"), int) or lin["linear_head_dim"] <= 0:
+        raise ValueError("linear_head_dim must be a resolved positive int")
+    if not isinstance(soft.get("radius"), int) or soft["radius"] < 0:
+        raise ValueError("softmax_attention.radius must be a resolved non-negative int")
+    if not isinstance(soft.get("chunk"), int) or soft["chunk"] < 0:
+        raise ValueError("softmax_attention.chunk must be a resolved non-negative int")
+    for key in ("enable_softmax_gate",):
+        if not isinstance(config.get(key), bool):
+            raise ValueError(f"{key} must be a resolved bool")
+    for key in ("a_fp32", "enable_text_state"):
+        if key in lin and not isinstance(lin[key], bool):
+            raise ValueError(f"linear_attention.{key} must be a resolved bool")
+
+
+def validate_model_spec(payload):
+    """Mirror the official OpenVDN ModelSpec v2 contract relevant to inference."""
+    if not isinstance(payload, dict):
+        raise ValueError("model_spec.json must contain an object")
+    if payload.get("format_version") != SPEC_FORMAT_VERSION:
+        raise ValueError(
+            f"spec format_version {payload.get('format_version')} != {SPEC_FORMAT_VERSION}")
+
+    base = payload.get("base")
+    if not isinstance(base, dict) or not isinstance(base.get("resolved_config"), dict):
+        raise ValueError("ModelSpec.base.resolved_config is required")
+    expected_hash = _config_hash(base["resolved_config"])
+    stored_hash = base.get("config_hash")
+    if stored_hash and stored_hash != expected_hash:
+        raise ValueError(
+            f"base.config_hash {stored_hash[:12]} does not match resolved_config "
+            f"({expected_hash[:12]})")
+
+    transforms = payload.get("transforms", [])
+    if not isinstance(transforms, list):
+        raise ValueError("ModelSpec.transforms must be a list")
+    hybrids = []
+    for index, transform in enumerate(transforms):
+        if not isinstance(transform, dict):
+            raise ValueError(f"transforms[{index}] must be an object")
+        config = transform.get("config")
+        if not isinstance(config, dict):
+            raise ValueError(f"transforms[{index}].config must be an object")
+        _require_resolved(config, f"transforms[{transform.get('type')}]")
+        leaked = sorted(set(_flat_keys(config)) & _RUNTIME_KEYS)
+        if leaked:
+            raise ValueError(
+                f"transforms[{transform.get('type')}] carries runtime keys {leaked}")
+        if transform.get("type") == "hybrid_attention":
+            if transform.get("version") != HYBRID_TRANSFORM_VERSION:
+                raise ValueError(
+                    f"hybrid_attention transform version {transform.get('version')}; "
+                    f"expected {HYBRID_TRANSFORM_VERSION}")
+            _validate_hybrid(config)
+            hybrids.append(transform)
+    if len(hybrids) != 1:
+        raise ValueError(
+            "model_spec.json must carry exactly one hybrid_attention transform, "
+            f"got {len(hybrids)}")
+
+    adapters = payload.get("adapters", [])
+    if not isinstance(adapters, list):
+        raise ValueError("ModelSpec.adapters must be a list")
+    for index, adapter in enumerate(adapters):
+        if not isinstance(adapter, dict):
+            raise ValueError(f"adapters[{index}] must be an object")
+        if not isinstance(adapter.get("type"), str) or not isinstance(adapter.get("version"), int):
+            raise ValueError(f"adapters[{index}] needs string type and integer version")
+        config = adapter.get("config")
+        if not isinstance(config, dict):
+            raise ValueError(f"adapters[{index}].config must be an object")
+        _require_resolved(config, f"adapters[{adapter.get('type')}]")
+    return hybrids[0]
 
 
 def transform_config(spec):
-    """Validate the ModelSpec's hybrid_attention transform; return its config."""
-    transforms = [t for t in spec.get("transforms", []) if t.get("type") == "hybrid_attention"]
-    if len(transforms) != 1:
-        raise ValueError("model_spec.json must carry exactly one hybrid_attention "
-                         f"transform, got {len(transforms)}")
-    t = transforms[0]
-    if t.get("version") != 2:
-        raise ValueError(f"hybrid_attention transform version {t.get('version')}; "
-                         "this node reads version 2 (the released VDN-H3 format)")
-    cfg = t["config"]
-    lin, soft = cfg["linear_attention"], cfg["softmax_attention"]
-    if lin["delta_rule"] not in SUPPORTED_DELTA_RULES:
-        raise ValueError(f"delta_rule {lin['delta_rule']!r} not supported")
-    if lin["bridge"] not in ("alpha", "none"):
-        raise ValueError(f"bridge {lin['bridge']!r} not supported")
-    targets = lin.get("short_conv", {}).get("targets", [])
-    if any(x not in SHORT_CONV_TARGETS for x in targets):
-        raise ValueError(f"short_conv targets {targets} not supported")
-    if cfg.get("anchor_frames") not in SUPPORTED_ANCHORS:
-        raise ValueError(f"anchor_frames {cfg.get('anchor_frames')!r} not supported")
-    if not isinstance(soft["radius"], int) or not isinstance(lin["linear_head_dim"], int):
-        raise ValueError("radius and linear_head_dim must be resolved ints")
-    return dict(
-        enable_softmax_gate=bool(cfg.get("enable_softmax_gate", True)),
-        anchor_frames=cfg["anchor_frames"],
-        radius=int(soft["radius"]),
-        chunk=int(soft.get("chunk", 0)),
-        delta_rule=lin["delta_rule"],
-        bridge=lin["bridge"],
-        a_fp32=bool(lin.get("a_fp32", True)),
-        linear_head_dim=int(lin["linear_head_dim"]),
-        short_conv=tuple(targets),
-        enable_text_state=bool(lin.get("enable_text_state", False)),
-    )
+    transform = validate_model_spec(spec)
+    cfg = transform["config"]
+    lin = cfg["linear_attention"]
+    soft = cfg["softmax_attention"]
+    return {
+        "enable_softmax_gate": cfg["enable_softmax_gate"],
+        "anchor_frames": cfg["anchor_frames"],
+        "radius": soft["radius"],
+        "chunk": soft["chunk"],
+        "delta_rule": lin["delta_rule"],
+        "bridge": lin["bridge"],
+        "a_fp32": lin.get("a_fp32", True),
+        "linear_head_dim": lin["linear_head_dim"],
+        "short_conv": tuple(lin["short_conv"]["targets"]),
+        "enable_text_state": lin.get("enable_text_state", False),
+    }
 
 
-_CACHE = {}
+def _required_branch_tensors(cfg):
+    required = {
+        "to_out_linear.weight",
+        "beta_proj.weight",
+        "norm.weight",
+        "alpha.A_log",
+        "alpha.dt_bias",
+        "alpha.down.weight",
+        "alpha.up.weight",
+        "output_gate.down.weight",
+        "output_gate.up.weight",
+        "output_gate.up.bias",
+    }
+    if cfg["enable_softmax_gate"]:
+        required |= {"softmax_gate.up.weight", "softmax_gate.up.bias"}
+    for target in cfg["short_conv"]:
+        required |= {
+            f"short_conv.{target}_sp.weight",
+            f"short_conv.{target}_tm.weight",
+        }
+    return required
 
 
-def load_vdn_checkpoint(path):
-    """Read model_spec.json + linear_branch + adapters. Returns
-    (cfg, branch_weights_by_block, {adapter_name: (sd, adapter_spec)}). Cached by
-    (path, mtime) so re-running the node doesn't re-read 5 GB."""
-    branch_path = _branch_file(path)
-    stamp = (path, os.path.getmtime(branch_path))
-    hit = _CACHE.get(stamp)
-    if hit is not None:
-        return hit
-
-    spec_path = os.path.join(path, "model_spec.json")
-    if not os.path.isfile(spec_path):
-        raise FileNotFoundError(
-            f"{path} has linear_branch/ but no model_spec.json; keep the official "
-            "release directory layout intact")
-    spec = _read_json(spec_path)
-    cfg = transform_config(spec)
-
-    branch_sd = _lazy_branch_sd(branch_path)
-    num_blocks = 0
+def _split_branches(path, branch_sd, cfg):
+    indices = set()
+    pattern = re.compile(r"^transformer_blocks\.(\d+)\.attn\.")
     for key in branch_sd:
-        if ".attn.to_out_linear.weight" in key:
-            num_blocks = max(num_blocks, int(key.split(".")[1]) + 1)
+        match = pattern.match(key)
+        if match:
+            indices.add(int(match.group(1)))
+    if not indices:
+        raise ValueError(f"{path}: branch checkpoint has no transformer blocks")
+    expected_indices = set(range(max(indices) + 1))
+    if indices != expected_indices:
+        raise ValueError(
+            f"{path}: branch block indices are not contiguous; got {sorted(indices)}")
+
+    required = _required_branch_tensors(cfg)
     branches = []
-    for i in range(num_blocks):
-        prefix = f"transformer_blocks.{i}.attn."
-        w = {}
+    for index in range(max(indices) + 1):
+        prefix = f"transformer_blocks.{index}.attn."
+        weights = {}
         for key, tensor in branch_sd.items():
             if not key.startswith(prefix):
                 continue
             name = key[len(prefix):]
-            # branch internals sit one level deeper in the checkpoint
-            # (...attn.linear_attention.alpha.A_log) and the branch reads bare names
             if name.startswith("linear_attention."):
                 name = name[len("linear_attention."):]
-            w[name] = tensor
-        missing = {"to_out_linear.weight", "beta_proj.weight", "norm.weight",
-                   "alpha.A_log", "alpha.dt_bias", "alpha.down.weight",
-                   "alpha.up.weight", "output_gate.down.weight",
-                   "output_gate.up.weight", "output_gate.up.bias"} - set(w)
+            weights[name] = tensor
+        missing = sorted(required - set(weights))
         if missing:
-            raise ValueError(f"block {i} of {path} is missing branch tensors: "
-                             f"{sorted(missing)}")
-        branches.append(w)
+            raise ValueError(
+                f"{path}: block {index} is missing required branch tensors: {missing}")
+        branches.append(weights)
+    return branches
+
+
+def _load_owned_safetensors(path):
+    identity = file_identity(path)
+    out = {}
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        for key in handle.keys():
+            out[key] = handle.get_tensor(key).clone()
+    _same_identity(identity)
+    return out
+
+
+def _validate_adapter_weights(name, state, config, path):
+    modules = {}
+    for key, tensor in state.items():
+        if ".lora_" not in key:
+            continue
+        module, rest = key.split(".lora_", 1)
+        side = rest.split(".", 1)[0]
+        if side in ("A", "B"):
+            modules.setdefault(module, {})[side] = tensor
+    if not modules:
+        raise ValueError(f"{path}: adapter {name!r} contains no LoRA A/B tensors")
+    for module, sides in modules.items():
+        if set(sides) != {"A", "B"}:
+            raise ValueError(
+                f"{path}: adapter {name!r} module {module} does not have both A and B")
+        a, b = sides["A"], sides["B"]
+        if a.ndim != 2 or b.ndim != 2 or a.shape[0] != b.shape[1]:
+            raise ValueError(
+                f"{path}: adapter {name!r} module {module} has incompatible "
+                f"A{tuple(a.shape)} B{tuple(b.shape)}")
+    if not isinstance(config, dict):
+        raise ValueError(f"{path}: adapter {name!r} config must be an object")
+
+
+def _stage_identity(path):
+    files = [_branch_file(path), os.path.join(path, "model_spec.json")]
+    adapters_root = os.path.join(path, "adapters")
+    if os.path.isdir(adapters_root):
+        for name in sorted(os.listdir(adapters_root)):
+            directory = os.path.join(adapters_root, name)
+            for filename in ("adapter_config.json", "adapter_model.safetensors"):
+                candidate = os.path.join(directory, filename)
+                if os.path.isfile(candidate):
+                    files.append(candidate)
+    return tuple(file_identity(p) for p in files)
+
+
+_CACHE = OrderedDict()
+_MAX_CACHE = 2
+
+
+def load_vdn_checkpoint(path):
+    """Load one official stage with strict invalidation and owned adapter tensors."""
+    branch_path = _branch_file(path)
+    if not os.path.isfile(branch_path):
+        raise FileNotFoundError(f"{path}: missing linear_branch/{BRANCH_FILE}")
+    spec_path = os.path.join(path, "model_spec.json")
+    if not os.path.isfile(spec_path):
+        raise FileNotFoundError(f"{path}: missing model_spec.json")
+
+    identity = _stage_identity(path)
+    hit = _CACHE.get(identity)
+    if hit is not None:
+        _CACHE.move_to_end(identity)
+        return hit
+
+    model_spec = _read_json(spec_path)
+    cfg = transform_config(model_spec)
+    branch_sd = _lazy_branch_sd(branch_path)
+    branches = _split_branches(path, branch_sd, cfg)
 
     adapters = {}
     adapters_root = os.path.join(path, "adapters")
     if os.path.isdir(adapters_root):
         for name in sorted(os.listdir(adapters_root)):
-            adir = os.path.join(adapters_root, name)
-            cfg_file = os.path.join(adir, "adapter_config.json")
-            weights_file = os.path.join(adir, "adapter_model.safetensors")
-            if os.path.isfile(cfg_file) and os.path.isfile(weights_file):
-                adapters[name] = (load_file(weights_file), _read_json(cfg_file))
+            directory = os.path.join(adapters_root, name)
+            config_path = os.path.join(directory, "adapter_config.json")
+            weights_path = os.path.join(directory, "adapter_model.safetensors")
+            if not (os.path.isfile(config_path) and os.path.isfile(weights_path)):
+                continue
+            config = _read_json(config_path)
+            state = _load_owned_safetensors(weights_path)
+            _validate_adapter_weights(name, state, config, path)
+            adapters[name] = (state, config)
 
     result = (cfg, branches, adapters)
-    _CACHE.clear()
-    _CACHE[stamp] = result
+    _CACHE[identity] = result
+    _CACHE.move_to_end(identity)
+    while len(_CACHE) > _MAX_CACHE:
+        _CACHE.popitem(last=False)
     return result

@@ -11,5 +11,9 @@ if _PKG not in sys.path:
     sys.path.insert(0, _PKG)
 
 from vdn_h3.nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from vdn_h3.compiler_guard import install_layout_guard as _install_layout_guard
+
+_install_layout_guard()
+del _install_layout_guard
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

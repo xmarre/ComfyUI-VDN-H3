@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "dev/**", "fix/**", "feature/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vdn-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  COMFY_SHA: 6c53f8c9a06d95f3d847009ceaae55c624169247
+  OPENVDN_SHA: b8cb28fbfca0266d1c7742a9f25ab8b58191de97
+
+jobs:
+  pinned:
+    name: Pinned Comfy + official oracle
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout tested ComfyUI
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: Comfy-Org/ComfyUI
+          ref: ${{ env.COMFY_SHA }}
+          path: _deps/ComfyUI
+      - name: Checkout official OpenVDN oracle
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: OpenVDN/vdn-minimax-h3
+          ref: ${{ env.OPENVDN_SHA }}
+          path: _deps/openvdn
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
+          python -m pip install -r _deps/ComfyUI/requirements.txt
+          python -m pip install pytest pytest-timeout ruff safetensors
+      - name: Static checks and compile Python sources
+        run: |
+          # Keep this lane correctness-focused rather than imposing an unrelated
+          # repository-wide style migration. E9/F catch syntax/name defects; B006
+          # catches shared mutable defaults on runtime entrypoints.
+          python -m ruff check --select E9,F,B006 --ignore F401,F841 vdn_h3 tests tools
+          python -m compileall -q vdn_h3 tests tools
+      - name: Run VDN test suite
+        env:
+          COMFYUI_ROOT: ${{ github.workspace }}/_deps/ComfyUI
+          OPENVDN_ROOT: ${{ github.workspace }}/_deps/openvdn
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/_deps/ComfyUI:${{ github.workspace }}/_deps/openvdn
+        run: pytest -q tests --timeout=120
+
+  comfy-main-smoke:
+    name: Current Comfy main smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout current ComfyUI main
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: Comfy-Org/ComfyUI
+          ref: master
+          path: _deps/ComfyUI
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
+          python -m pip install -r _deps/ComfyUI/requirements.txt
+          python -m pip install pytest safetensors
+      - name: Import and node-registration smoke
+        env:
+          COMFYUI_ROOT: ${{ github.workspace }}/_deps/ComfyUI
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/_deps/ComfyUI
+        run: |
+          python -m compileall -q vdn_h3
+          python - <<'PY'
+          import importlib.util
+          import pathlib
+
+          # Comfy disables argv parsing for library imports. Set its parsed CPU flag
+          # directly before importing model_management; this lane uses CPU-only torch.
+          import comfy.cli_args
+          comfy.cli_args.args.cpu = True
+
+          root = pathlib.Path('.').resolve()
+          spec = importlib.util.spec_from_file_location(
+              'comfy_vdn_h3', root / '__init__.py',
+              submodule_search_locations=[str(root)])
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          assert {'ApplyVDNH3', 'ApplyVDNH3Advanced'} <= set(mod.NODE_CLASS_MAPPINGS)
+
+          # Current Comfy master contains the AIMDO malloc-graph compiler stack that
+          # upstream VDN v1.4.3 guards. Exercise our real detector and restoration
+          # against that checkout rather than relying only on mocked unit coverage.
+          from vdn_h3 import compiler_guard
+          assert compiler_guard._compiler_stack_present()
+          comfy.cli_args.args.disable_comfy_compiler = False
+          with compiler_guard.disabled_for_vdn() as owns:
+              assert owns is True
+              assert comfy.cli_args.args.disable_comfy_compiler is True
+          assert comfy.cli_args.args.disable_comfy_compiler is False
+
+          print('node registration + current compiler guard: ok')
+          PY

@@ -1,81 +1,50 @@
 # Upstream reconciliation
 
-This branch is not a mechanical merge of `Saganaki22/ComfyUI-VDN-H3`.  The fork has
-intentional lifecycle, quantization, Continuum and Flow target-sparse changes, so
-upstream deltas are reviewed by behavior and then adapted only where they preserve
-those invariants.
+This fork keeps the released VDN-H3 architecture and tracks the original ComfyUI port while replacing lifecycle mechanisms that conflict with Comfy's model ownership or the Flow-Aligned mixed-grid contract.
 
-## Reconciled upstream snapshot
+## Reference points
 
-Audited upstream head:
+- Original ComfyUI port: `Saganaki22/ComfyUI-VDN-H3`
+- Reconciled upstream head: `b49130c26a70d12c542601c5bc4f7ee0f112ee2e` (`v1.4.3`)
+- Official OpenVDN numerical oracle: `OpenVDN/vdn-minimax-h3@b8cb28fbfca0266d1c7742a9f25ab8b58191de97`
 
-- repository: `Saganaki22/ComfyUI-VDN-H3`
-- head: `fe6e6f2f26075f03dea09b5216e14db727af4b77`
-- prior snapshot already reconciled by this PR: `e49edae28266bcaa9b74988ac95ef4dd035f959c`
-- delta: 9 upstream commits
+## Upstream v1.4.x work retained in this fork
 
-### Commit-by-commit disposition
+The useful performance/runtime intent is preserved:
 
-| Upstream commit | Purpose | Fork disposition |
-| --- | --- | --- |
-| `57e92f12662b659f5be591ecb7e8f2deb58396e1` | v1.4.1 fast-kernel/default workaround | No net import: upstream itself reverted this in `29ed2a2...`. |
-| `29ed2a2cdc45d97bdfb54dd6bc43b8ecb7f021b4` | Revert v1.4.1 workaround | Net state retained; there is nothing to port. |
-| `103badc8eb8376d2589e4045530f9557296cab6d` | Suppress rejected-SDPA probe warnings and demote compile-fallback logging | Audited. The fork's grouped path dispatches through Comfy's `optimized_attention` / `comfy.ops.scaled_dot_product_attention` and has no upstream `_log_backend_once` probe loop, so that window change does not apply. Compile-helper fallback remains explicit because `fast_kernels` is an opt-in ablation in this fork. |
-| `aa03c363a13b6b111680c6c358dd27ea7701d512` | Detect the new Comfy AIMDO compiler incompatibility | Adopted, but not as an Apply-time persistent global toggle. |
-| `edc5101091518757342ddf783a57188dbae93372` | Tooltips, compiler scoping attempt, README notes, refreshed example workflow | Runtime compiler intent adopted. Fork-specific node tooltips/options supersede upstream `cache_gpu`/old-bypass text, so they are not overwritten wholesale. The example workflow is not copied blindly because the fork's node contract intentionally differs and the PNG/JSON pair must stay synchronized. |
-| `e81634f37b0e650b7059e838d0dee2fdc6d24ce2` | Document compiler-off lifetime caveat | Superseded by the final per-forward guard below. |
-| `dbc94d5e045d6766a47e7ef12dc19dc029b79694` | Fix compiler-stack detector | Adopted: detection follows the final upstream `comfy_aimdo.malloc_graph` stack shape. |
-| `4478aa462e185282da380f9a1c6224bfc35a469c` | Fix import shadowing in compiler shim | Not reproduced: the fork guard uses module-level imports/lazy module lookup without the shadowing pattern. |
-| `fe6e6f2f26075f03dea09b5216e14db727af4b77` | Scope compiler disable to VDN forwards and remove unload hook | Adopted and hardened. |
+- VRAM-aware branch placement;
+- optional native INT8 ConvRot branch selection under pressure;
+- one-block stream lookahead;
+- reusable scan/window/activation scratch;
+- grouped/Flex attention runtime improvements;
+- the AIMDO malloc-graph compatibility workaround;
+- v1.4.3's `cudaMallocAsync` rule: explicit `record_stream` is skipped when the allocator is already stream ordered.
 
-## Compiler guard adaptation
+## Lifecycle differences kept intentionally
 
-Upstream v1.4.3 established that Comfy builds with the AIMDO malloc-graph model
-compiler can hard-fail on VDN-patched MiniMax-H3 forwards.  Current Comfy exposes
-only the process-global `args.disable_comfy_compiler` control.
+The fork does not copy upstream process-global resource ownership verbatim:
 
-The fork therefore installs a guard around **VDN's own `DIFFUSION_MODEL` execution
-wrapper**, not around Comfy core functions and not around model lifetime:
+- no persistent process-global safetensors handles;
+- no private process-global resident GPU branch cache;
+- ordinary BF16 resident branch weights are a Comfy-managed additional `ModelPatcher`;
+- quantized branch weights remain streamed;
+- retained scan/window/activation storage belongs to one `VDNState` and is leased per execution;
+- nested/concurrent execution that cannot acquire the retained pool receives isolated transient scratch;
+- one-block prefetch uses a single bounded tensor-less executor and at most one state-owned future/result;
+- completed prefetch results cannot be overwritten before `take()` consumes them;
+- prefetch identity includes block, full device identity and compute dtype;
+- Flex BlockMask caching is bounded and keyed by full device/layout identity.
 
-- lazy detection; old Comfy builds are a no-op;
-- a user-supplied `--disable-comfy-compiler` setting is preserved;
-- VDN-owned disables are reference-counted for nested/overlapping VDN wrappers;
-- restoration occurs in `finally`, including exceptions/cancellation;
-- no unload hook is installed;
-- no Comfy function is monkey-patched;
-- no flag is left disabled between VDN forwards.
+## Adapter lifecycle differences
 
-Because Comfy's switch is process-global, a truly concurrent non-VDN forward in a
-different executor thread cannot be perfectly isolated by any consumer-side toggle.
-The normal Comfy prompt executor is serialized; the fork avoids widening that global
-state beyond the VDN forward itself.
+The old forward-hook LoRA bypass was removed. `lora_mode=bypass` now means Comfy-managed runtime weight/bias wrappers. VDN never traverses, replaces, restores, or chains LoRA target `module.forward` methods.
 
-Tests cover no-op behavior on old stacks, exception restoration, preservation of a
-user-disabled compiler, nested guard ownership and idempotent wrapper installation.
+Full-width released AdaLN LoRAs on supported pruned/curve H3 bases are projected through the model's pruning affine, including the required constant bias term.
 
-## Changes intentionally not reintroduced
+## Flow-Aligned external sequence
 
-Earlier upstream v1.4 resource work used implementation patterns that this fork has
-already replaced with stricter ownership:
+This fork additionally defines API 2 for `mixed_grid_low_suffix`, used by `xmarre/MiniMax-H3-Flow-Aligned-Regenerate`. It keeps the learned dense gate active on the mixed sequence while disabling only geometry-dependent local/linear-complement processing. API 1 target-sparse compatibility remains accepted.
 
-- private process-global branch GPU cache -> Comfy-managed resident additional model;
-- quantized resident materialization -> quantized branch streaming;
-- persistent/process-global scratch -> `VDNState`-owned bounded runtime buffers;
-- per-state immortal prefetch thread -> one bounded tensor-less executor with
-  state-owned cancellable result;
-- unbounded/device-type-only Flex mask caching -> bounded full-device/layout LRU.
+## v1.4.3 allocator change
 
-Those are not merge conflicts to resolve by reverting the fork; they are deliberate
-lifecycle adaptations of the same performance intent.
-
-## Validation requirement
-
-A reconciliation is considered complete only when both CI lanes pass on the exact
-final tree:
-
-1. pinned Comfy + pinned OpenVDN direct numerical/orchestration oracle;
-2. current Comfy `master` import/node-registration smoke.
-
-Production GPU validation remains a separate gate and must still exercise the
-AIMDO-era Comfy build with VDN, Continuum, Spectrum and the Flow target-sparse
-external-sequence contract.
+Upstream commit `b49130c26a70d12c542601c5bc4f7ee0f112ee2e` skips `record_stream` under `cudaMallocAsync`. This fork adopts the same allocator condition in `vdn_h3.runtime._StreamPrefetcher`, where this branch actually owns its asynchronous prefetch lifecycle. The behavior is covered by a dedicated regression test.

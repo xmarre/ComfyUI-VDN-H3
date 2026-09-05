@@ -1,10 +1,13 @@
 [project]
 name = "comfyui-vdn-h3"
-version = "1.3.1"
+version = "1.5.0"
 description = "VDN-H3 hybrid attention for ComfyUI's native MiniMax-H3 model"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
-authors = [{ name = "Saganaki22" }]
+authors = [
+  { name = "Saganaki22" },
+  { name = "xmarre" },
+]
 keywords = ["comfyui", "minimax-h3", "vdn", "video", "attention"]
 classifiers = [
   "License :: OSI Approved :: Apache Software License",
@@ -17,11 +20,12 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/Saganaki22/ComfyUI-VDN-H3"
-Issues = "https://github.com/Saganaki22/ComfyUI-VDN-H3/issues"
+Repository = "https://github.com/xmarre/ComfyUI-VDN-H3"
+Issues = "https://github.com/xmarre/ComfyUI-VDN-H3/issues"
+Upstream = "https://github.com/Saganaki22/ComfyUI-VDN-H3"
 OpenVDN = "https://github.com/OpenVDN/vdn-minimax-h3"
 
 [tool.comfy]
-PublisherId = "saganaki22"
+PublisherId = "xmarre"
 DisplayName = "ComfyUI-VDN-H3"
 Icon = "https://avatars.githubusercontent.com/u/84208527"

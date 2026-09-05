@@ -36,6 +36,7 @@ _ACTIVE_BUFFERS = contextvars.ContextVar("vdn_active_runtime_buffers", default=N
 # each RuntimeBuffers owns at most one Future/result and drops it on reset.
 _PREFETCH_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="vdn-branch-prefetch")
+_RECORD_STREAM_NEEDED = None
 
 
 def current_runtime_buffers():
@@ -52,6 +53,24 @@ def _bounded_put(mapping, key, value, limit):
     return value
 
 
+def _record_stream_needed():
+    """Whether torch's allocator requires explicit record_stream ownership.
+
+    Under cudaMallocAsync the allocator is stream ordered already. record_stream is a
+    no-op there and recent torch versions warn for every call. This mirrors upstream
+    VDN v1.4.3 while keeping the decision in this fork's state-owned prefetch layer.
+    """
+    global _RECORD_STREAM_NEEDED
+    if _RECORD_STREAM_NEEDED is None:
+        try:
+            _RECORD_STREAM_NEEDED = torch.cuda.get_allocator_backend() != "cudaMallocAsync"
+        except Exception:
+            # Older/custom torch builds may not expose the allocator query. Preserve
+            # the conservative caching-allocator behavior in that case.
+            _RECORD_STREAM_NEEDED = True
+    return _RECORD_STREAM_NEEDED
+
+
 class _StreamPrefetcher:
     """One cancellable in-flight block transfer; no per-state worker/thread leak."""
 
@@ -63,6 +82,8 @@ class _StreamPrefetcher:
 
     @staticmethod
     def _record_stream(tensor, stream):
+        if not _record_stream_needed():
+            return
         seen = [tensor]
         inner = getattr(tensor, "_qdata", None)
         if isinstance(inner, torch.Tensor):

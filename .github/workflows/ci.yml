@@ -18,6 +18,16 @@ env:
   OPENVDN_SHA: b8cb28fbfca0266d1c7742a9f25ab8b58191de97
 
 jobs:
+  frontend-compat:
+    name: Legacy workflow migration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run positional-widget migration regression
+        run: node --test tests/test_widget_migration.mjs
+
   pinned:
     name: Pinned Comfy + official oracle
     runs-on: ubuntu-latest
@@ -52,9 +62,6 @@ jobs:
           python -m pip install pytest pytest-timeout ruff safetensors
       - name: Static checks and compile Python sources
         run: |
-          # Keep this lane correctness-focused rather than imposing an unrelated
-          # repository-wide style migration. E9/F catch syntax/name defects; B006
-          # catches shared mutable defaults on runtime entrypoints.
           python -m ruff check --select E9,F,B006 --ignore F401,F841 vdn_h3 tests tools
           python -m compileall -q vdn_h3 tests tools
       - name: Run VDN test suite
@@ -99,8 +106,6 @@ jobs:
           import importlib.util
           import pathlib
 
-          # Comfy disables argv parsing for library imports. Set its parsed CPU flag
-          # directly before importing model_management; this lane uses CPU-only torch.
           import comfy.cli_args
           comfy.cli_args.args.cpu = True
 
@@ -111,10 +116,8 @@ jobs:
           mod = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(mod)
           assert {'ApplyVDNH3', 'ApplyVDNH3Advanced'} <= set(mod.NODE_CLASS_MAPPINGS)
+          assert mod.WEB_DIRECTORY == './web'
 
-          # Current Comfy master contains the AIMDO malloc-graph compiler stack that
-          # upstream VDN v1.4.3 guards. Exercise our real detector and restoration
-          # against that checkout rather than relying only on mocked unit coverage.
           from vdn_h3 import compiler_guard
           assert compiler_guard._compiler_stack_present()
           comfy.cli_args.args.disable_comfy_compiler = False

@@ -1,0 +1,59 @@
+from __future__ import annotations
+
+import torch
+
+from vdn_h3 import retained, window
+
+
+def test_retained_windows_do_not_forward_transformer_options(monkeypatch):
+    """The PR-#2 retained helper must preserve v1.3.1 exact-window semantics."""
+    original = window._sdpa
+    seen_options = []
+
+    def recording_sdpa(q, k, v, scale, transformer_options=None):
+        seen_options.append(transformer_options)
+        return original(q, k, v, scale, transformer_options)
+
+    monkeypatch.setattr(window, "_sdpa", recording_sdpa)
+
+    torch.manual_seed(520)
+    video_start, tokens, frames, heads, dim = 3, 4, 6, 2, 8
+    video_end = video_start + frames * tokens
+    seq = video_end + 2
+    q = torch.randn(seq, heads, dim)
+    k = torch.randn(seq, heads, dim)
+    v = torch.randn(seq, heads, dim)
+    bounds = window.window_bounds(frames, 1, 3)
+    override = {"optimized_attention_override": object(), "sentinel": True}
+
+    got = retained.window_softmax_grouped_runtime(
+        q,
+        k,
+        v,
+        video_start,
+        video_end,
+        frames,
+        tokens,
+        bounds,
+        dim ** -0.5,
+        anchor_frames="both",
+        transformer_options=override,
+    )
+
+    assert seen_options
+    assert all(option is None for option in seen_options)
+
+    want = window.window_softmax_grouped(
+        q,
+        k,
+        v,
+        video_start,
+        video_end,
+        frames,
+        tokens,
+        bounds,
+        dim ** -0.5,
+        anchor_frames="both",
+        transformer_options=None,
+    )
+    assert torch.allclose(got, want, atol=1e-6, rtol=1e-6)

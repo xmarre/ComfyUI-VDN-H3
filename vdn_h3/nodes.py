@@ -8,13 +8,19 @@ import comfy.model_management
 
 from vdn_h3.adapters import convert_adapter
 from vdn_h3.apply import apply_adapters
+from vdn_h3.branch import LinearBranch
 from vdn_h3.hybrid import VDNState, apply_vdn
-from vdn_h3.managed import make_managed_branch_patcher
-from vdn_h3.retained import RuntimeLinearBranch
 import vdn_h3.policy as policy
 import vdn_h3.spec as spec
 
 _log = logging.getLogger("comfy.vdn")
+
+
+# Diagnostic correctness baseline: the fork was production-clean on v1.3.1 before
+# the upstream v1.4 execution/retention reconciliation.  Keep all current adapter,
+# Comfy compatibility and Flow contracts, but deliberately remove the v1.4 stateful
+# execution layer from the production path until multi-chunk parity is re-established.
+_V131_EXECUTION_BASELINE = True
 
 
 def _validate_branch_shapes(path, branches, cfg, hidden, heads, head_dim):
@@ -70,13 +76,7 @@ def _free_vram():
 
 
 def _effective_free_vram(model):
-    """Conservative free VRAM after reserving still-unloaded base-model bytes.
-
-    Apply nodes may execute before Comfy has made the supplied H3 MODEL resident. Raw
-    allocator free memory would then make `auto` optimistically choose a resident VDN
-    branch or retained scratch even though the base itself still has to load. Reserve
-    the ModelPatcher's remaining model bytes before applying the placement heuristics.
-    """
+    """Conservative free VRAM after reserving still-unloaded base-model bytes."""
     raw = int(_free_vram())
     try:
         model_size = int(model.model_size())
@@ -100,7 +100,6 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
     if lora_mode not in ("merge", "bypass"):
         raise ValueError(f"lora_mode must be merge or bypass, got {lora_mode!r}")
     if branch_weights == "cache_gpu":
-        _log.warning("[vdn] branch_weights=cache_gpu is deprecated; using resident")
         branch_weights = "resident"
     if branch_weights not in ("auto", "stream", "resident"):
         raise ValueError(
@@ -110,24 +109,35 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
             f"retain_buffers must be auto, on or off, got {retain_buffers!r}")
 
     path = spec.resolve_vdn_checkpoint(vdn_checkpoint)
-    free = (
-        _effective_free_vram(model)
-        if branch_weights == "auto" or retain_buffers == "auto"
-        else None
-    )
-    prefer_int8 = False
-    if branch_weights == "auto":
-        branch_weights, prefer_int8 = policy.auto_branch_policy(path, free)
 
+    # v1.4 introduced three execution-level changes together: automatic resident
+    # branch placement, retained cross-call scratch/prefetch, and RuntimeLinearBranch.
+    # The upstream parity gate covered standalone renders, not sequential Continuum
+    # chunks whose conditioning/reference inventory changes between executions.  The
+    # observed regression is specifically chunk-2 state/reference oscillation.  For
+    # this diagnostic branch, restore the v1.3.1 execution contract exactly where it
+    # matters: synchronous per-block streaming, transient per-call storage, eager
+    # LinearBranch math.  Adapter/Flow/Comfy compatibility code remains current.
+    requested_branch_weights = branch_weights
+    requested_retain = retain_buffers
+    if requested_branch_weights != "stream" or requested_retain != "off" or fast_kernels:
+        _log.warning(
+            "[vdn] v1.3.1 execution baseline active: forcing branch_weights=stream, "
+            "retain_buffers=off, fast_kernels=False (requested branch=%s buffers=%s "
+            "fast_kernels=%s)",
+            requested_branch_weights, requested_retain, fast_kernels)
+    branch_weights = "stream"
+    retain = False
+    fast_kernels = False
+
+    # Preserve the stage file the user selected.  Do not auto-promote a 96-GB card to
+    # a resident BF16 branch or silently switch stage representation while diagnosing
+    # execution parity.
+    prefer_int8 = False
     cfg, branch_weights_by_block, adapters, branch_path = policy.load_vdn_checkpoint(
         path, prefer_int8=prefer_int8)
     cfg = dict(cfg)
     cfg.setdefault("linear_enabled", True)
-
-    if retain_buffers == "auto":
-        retain = policy.auto_retain_policy(path, prefer_int8, free)
-    else:
-        retain = retain_buffers == "on"
 
     if cfg_overrides:
         changed = {
@@ -165,7 +175,7 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
         path, branch_weights_by_block, cfg, hidden, heads, head_dim)
 
     branches = [
-        RuntimeLinearBranch(
+        LinearBranch(
             weights,
             heads,
             head_dim,
@@ -178,13 +188,7 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
         for weights in branch_weights_by_block
     ]
     for branch in branches:
-        branch.fuse_epilogue = fast_kernels
-
-    managed_weights = None
-    managed_patcher = None
-    if branch_weights == "resident":
-        managed_weights, managed_patcher = make_managed_branch_patcher(
-            branch_weights_by_block, model)
+        branch.fuse_epilogue = False
 
     state = VDNState(
         vdn_checkpoint,
@@ -192,14 +196,12 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
         branches,
         heads,
         head_dim,
-        managed_weights=managed_weights,
-        retain_buffers=retain,
+        managed_weights=None,
+        retain_buffers=False,
     )
     state.softmax_backend = attention_backend
 
     new_model = model.clone()
-    if managed_patcher is not None:
-        new_model.set_additional_models("vdn_branch", [managed_patcher])
     apply_vdn(new_model, state)
 
     wanted = {"default"}
@@ -230,7 +232,8 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
     )
     _log.info(
         "[vdn] %s applied: blocks=%d radius=%d chunk=%d anchors=%s rule=%s "
-        "branch=%s/%s buffers=%s backend=%s lora_mode=%s adapters=%s",
+        "branch=%s/%s buffers=%s backend=%s lora_mode=%s baseline=v1.3.1-sync "
+        "adapters=%s",
         vdn_checkpoint,
         len(branches),
         cfg["radius"],
@@ -239,7 +242,7 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
         cfg["delta_rule"],
         os.path.basename(branch_path),
         branch_weights,
-        "retained" if retain else "transient",
+        "transient",
         attention_backend,
         lora_mode,
         report,
@@ -265,22 +268,17 @@ class ApplyVDNH3:
             "lora_mode": (["merge", "bypass"], {
                 "default": "merge",
                 "tooltip": "merge uses normal Comfy weight patches. bypass uses "
-                           "stack-safe Comfy BypassForwardHook adapters for ordinary "
-                           "targets, preserving native quantized forwards while safely "
-                           "stacking with other runtime bypass providers."}),
+                           "VDN-owned PyTorch forward post-hooks, pre-stages runtime "
+                           "factors before H3 execution, and leaves pruned curve AdaLN "
+                           "base weights untouched; fused INT8 fc2 remains native."}),
             "branch_weights": (["auto", "stream", "resident"], {
                 "default": "auto",
-                "tooltip": "auto: resident BF16 when the base-reserved VRAM budget "
-                           "exceeds 1.5x branch size + 4 GiB; otherwise stream and "
-                           "prefer native INT8 ConvRot when available. stream resolves "
-                           "one block at a time with safe one-block prefetch when buffers "
-                           "are retained. resident is a Comfy-managed additional model."}),
+                "tooltip": "Diagnostic v1.3.1 execution baseline currently forces "
+                           "synchronous stream mode regardless of this saved value."}),
             "retain_buffers": (["auto", "on", "off"], {
                 "default": "auto",
-                "tooltip": "auto retains VDN-owned scratch when the base-reserved VRAM "
-                           "budget is at least selected branch size + 10 GiB. Scratch is "
-                           "leased per execution; concurrent/nested runs use isolated "
-                           "transient storage."}),
+                "tooltip": "Diagnostic v1.3.1 execution baseline currently forces "
+                           "transient per-call buffers regardless of this saved value."}),
             "verbose": ("BOOLEAN", {"default": False}),
             "attention_backend": (["grouped", "flex"], {
                 "default": "grouped",
@@ -319,9 +317,9 @@ class ApplyVDNH3Advanced:
                 "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
             "lora_mode": (["merge", "bypass"], {
                 "default": "merge",
-                "tooltip": "bypass uses VDN's stack-safe Comfy bypass-hook lifecycle "
-                           "for ordinary LoRA targets; projected curve AdaLN remains "
-                           "under normal native weight/bias patches."}),
+                "tooltip": "bypass uses VDN-owned PyTorch forward post-hooks and "
+                           "never replaces module.forward or materializes projected "
+                           "curve AdaLN base weights; fused INT8 fc2 stays native."}),
             "branch_weights": (["auto", "stream", "resident"], {"default": "auto"}),
             "retain_buffers": (["auto", "on", "off"], {"default": "auto"}),
             "verbose": ("BOOLEAN", {"default": False}),
@@ -349,8 +347,8 @@ class ApplyVDNH3Advanced:
                            "window-only ablation."}),
             "fast_kernels": ("BOOLEAN", {
                 "default": False,
-                "tooltip": "Compile selected mathematically equivalent branch helpers; "
-                           "first run includes compile cost and eager remains fallback."}),
+                "tooltip": "Diagnostic v1.3.1 execution baseline currently forces "
+                           "this off."}),
         }}
 
     RETURN_TYPES = ("MODEL",)

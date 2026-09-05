@@ -24,6 +24,10 @@ _log = logging.getLogger("comfy.vdn")
 _seen = collections.OrderedDict()
 _MAX_SEEN = 128
 
+VDN_EXTERNAL_SEQUENCE_KEY = "vdn_h3_external_sequence_v1"
+VDN_EXTERNAL_SEQUENCE_API_VERSION = 1
+VDN_EXTERNAL_SEQUENCE_MODE = "dense_gate_no_linear"
+
 
 def _once(key, message):
     if key in _seen:
@@ -192,6 +196,30 @@ def _base_attention(attn, x, rope_freqs, transformer_options):
     return attn.out_proj(out.squeeze(0))
 
 
+def _external_reduced_sequence_active(transformer_options, layout, sequence_rows, rope_freqs):
+    if sequence_rows == layout.seq_len:
+        return False
+    if sequence_rows > layout.seq_len:
+        raise RuntimeError(
+            f"VDN packed sequence length {sequence_rows} exceeds published layout {layout.seq_len}")
+
+    contract = transformer_options.get(VDN_EXTERNAL_SEQUENCE_KEY)
+    if not isinstance(contract, dict):
+        raise RuntimeError(
+            "VDN received a reduced packed sequence without an explicit external-sequence contract")
+    if int(contract.get("api", -1)) != VDN_EXTERNAL_SEQUENCE_API_VERSION:
+        raise RuntimeError("VDN external reduced-sequence contract API is unsupported")
+    if contract.get("mode") != VDN_EXTERNAL_SEQUENCE_MODE:
+        raise RuntimeError("VDN external reduced-sequence contract mode is unsupported")
+    if int(contract.get("full_sequence_rows", -1)) != layout.seq_len:
+        raise RuntimeError("VDN external reduced-sequence full-row count does not match the published layout")
+    if int(contract.get("reduced_sequence_rows", -1)) != sequence_rows:
+        raise RuntimeError("VDN external reduced-sequence row count does not match the current hidden stream")
+    if rope_freqs is not None and (rope_freqs.ndim < 2 or int(rope_freqs.shape[1]) != sequence_rows):
+        raise RuntimeError("VDN external reduced sequence requires RoPE rows matching the reduced hidden stream")
+    return True
+
+
 def make_vdn_forward(attn, state, block_index):
     heads, head_dim = attn.heads, attn.head_dim
     inner = heads * head_dim
@@ -213,13 +241,22 @@ def make_vdn_forward(attn, state, block_index):
         branch._backend_key = None
 
         s = x.shape[0]
+        external_reduced = _external_reduced_sequence_active(
+            transformer_options, layout, s, rope_freqs)
+        if external_reduced:
+            _once(
+                ("external-reduced", layout.seq_len, s),
+                f"external reduced sequence {s}/{layout.seq_len}: using dense gated "
+                "attention with the geometry-dependent linear complement disabled",
+            )
+
         device, dtype = x.device, x.dtype
         q, k, v = qkv_proj(x).split(inner, dim=-1)
         v = v.view(s, heads, head_dim)
         q_raw = q.view(s, heads, head_dim)
         k_raw = k.view(s, heads, head_dim)
 
-        window_active = not layout.full_cover
+        window_active = not layout.full_cover and not external_reduced
         linear_active = window_active and cfg.get("linear_enabled", True)
         q_raw_video = k_raw_video = v_video = None
         text_x = text_k_raw = text_v_raw = None
@@ -330,6 +367,7 @@ def make_vdn_forward(attn, state, block_index):
         return out
 
     vdn_forward._vdn_forward = True
+    vdn_forward._vdn_external_sequence_api = VDN_EXTERNAL_SEQUENCE_API_VERSION
     return vdn_forward
 
 

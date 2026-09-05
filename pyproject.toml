@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-vdn-h3"
-version = "1.5.0"
+version = "1.5.1"
 description = "VDN-H3 hybrid attention for ComfyUI's native MiniMax-H3 model"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }

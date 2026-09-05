@@ -125,6 +125,19 @@ def test_external_reduced_sequence_preserves_vdn_softmax_gate(monkeypatch):
     assert torch.allclose(got, expected, atol=1e-6, rtol=1e-6)
 
 
+def test_external_reduced_sequence_rejects_mismatched_rope_rows():
+    attn = _TinyAttention()
+    state, layout = _state()
+    x = torch.randn(5, 4)
+    rope = torch.randn(1, 4, 1, 1, 1, 1)
+    token = state._layout.set(layout)
+    try:
+        with pytest.raises(RuntimeError, match="RoPE rows matching the reduced hidden stream"):
+            make_vdn_forward(attn, state, 0)(x, rope_freqs=rope, transformer_options=_contract())
+    finally:
+        state._layout.reset(token)
+
+
 @pytest.mark.parametrize(
     "payload, match",
     [

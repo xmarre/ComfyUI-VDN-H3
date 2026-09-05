@@ -8,9 +8,9 @@ import comfy.model_management
 
 from vdn_h3.adapters import convert_adapter
 from vdn_h3.apply import apply_adapters
+from vdn_h3.branch import LinearBranch
 from vdn_h3.hybrid import VDNState, apply_vdn
 from vdn_h3.managed import make_managed_branch_patcher
-from vdn_h3.retained import RuntimeLinearBranch
 import vdn_h3.policy as policy
 import vdn_h3.spec as spec
 
@@ -24,7 +24,7 @@ def _validate_branch_shapes(path, branches, cfg, hidden, heads, head_dim):
         raise RuntimeError(
             f"{path}: checkpoint linear_head_dim={linear_dim}, but this Comfy port shares "
             f"the base Q/K/V whose head_dim={head_dim}. The official architecture has "
-            "no projection between them; refusing an incompatible base/checkpoint pair.")
+            f"no projection between them; refusing an incompatible base/checkpoint pair.")
 
     expected = {
         "to_out_linear.weight": (hidden, heads * linear_dim),
@@ -64,39 +64,16 @@ def _validate_branch_shapes(path, branches, cfg, hidden, heads, head_dim):
         raise RuntimeError(f"VDN checkpoint/base shape mismatch in {path}: {preview}")
 
 
-def _free_vram():
-    device = comfy.model_management.get_torch_device()
-    return comfy.model_management.get_free_memory(device)
-
-
-def _effective_free_vram(model):
-    """Conservative free VRAM after reserving still-unloaded base-model bytes.
-
-    Apply nodes may execute before Comfy has made the supplied H3 MODEL resident. Raw
-    allocator free memory would then make `auto` optimistically choose a resident VDN
-    branch or retained scratch even though the base itself still has to load. Reserve
-    the ModelPatcher's remaining model bytes before applying the placement heuristics.
-    """
-    raw = int(_free_vram())
-    try:
-        model_size = int(model.model_size())
-        loaded_size = int(model.loaded_size())
-        remaining = max(0, model_size - loaded_size)
-    except Exception as exc:
-        _log.warning(
-            "[vdn] could not reserve unloaded MODEL bytes for auto VRAM policy (%s); "
-            "using raw free-memory reading", exc)
-        remaining = 0
-    effective = max(0, raw - remaining)
-    _log.info(
-        "[vdn] auto VRAM budget: %.2f GiB raw - %.2f GiB unloaded base = %.2f GiB",
-        raw / (1 << 30), remaining / (1 << 30), effective / (1 << 30))
-    return effective
-
-
 def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
                attention_backend, verbose, apply_turbo_adapter=True,
-               cfg_overrides=None, fast_kernels=False, retain_buffers="auto"):
+               cfg_overrides=None, fast_kernels=False, retain_buffers="off"):
+    """Apply VDN using the known-good v1.3.1 execution topology.
+
+    Upstream v1.4 introduced automatic resident placement, retained scratch and a
+    side-stream one-block prefetcher. Those changes are deliberately quarantined
+    here while the post-v1.3.1 regression is isolated. The current Comfy compiler
+    guard, adapter fixes and Flow external-sequence APIs remain in place.
+    """
     if lora_mode not in ("merge", "bypass"):
         raise ValueError(f"lora_mode must be merge or bypass, got {lora_mode!r}")
     if branch_weights == "cache_gpu":
@@ -110,24 +87,31 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
             f"retain_buffers must be auto, on or off, got {retain_buffers!r}")
 
     path = spec.resolve_vdn_checkpoint(vdn_checkpoint)
-    free = (
-        _effective_free_vram(model)
-        if branch_weights == "auto" or retain_buffers == "auto"
-        else None
-    )
-    prefer_int8 = False
-    if branch_weights == "auto":
-        branch_weights, prefer_int8 = policy.auto_branch_policy(path, free)
 
+    # v1.3.1 had synchronous per-block streaming as its normal execution path.
+    # Keep the newer option in the schema for workflow compatibility, but do not
+    # let the v1.4 auto policy silently select resident weights on large GPUs.
+    if branch_weights == "auto":
+        branch_weights = "stream"
+        _log.info(
+            "[vdn] rollback baseline: branch_weights=auto -> synchronous stream "
+            "(v1.3.1 execution semantics)")
+
+    # v1.4 retained scan/window/activation scratch and side-stream prefetch are
+    # intentionally disabled until they can independently pass the production gate.
+    if retain_buffers == "on":
+        _log.warning(
+            "[vdn] retain_buffers=on ignored by rollback baseline; upstream v1.4 "
+            "retained/prefetch execution is quarantined")
+    retain = False
+
+    # v1.3.1 preferred the ordinary branch file when both representations existed.
+    # Explicit stream therefore resolves through the strict baseline selector.
+    prefer_int8 = False
     cfg, branch_weights_by_block, adapters, branch_path = policy.load_vdn_checkpoint(
         path, prefer_int8=prefer_int8)
     cfg = dict(cfg)
     cfg.setdefault("linear_enabled", True)
-
-    if retain_buffers == "auto":
-        retain = policy.auto_retain_policy(path, prefer_int8, free)
-    else:
-        retain = retain_buffers == "on"
 
     if cfg_overrides:
         changed = {
@@ -164,8 +148,10 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
     _validate_branch_shapes(
         path, branch_weights_by_block, cfg, hidden, heads, head_dim)
 
+    # Use the original eager branch implementation directly. RuntimeLinearBranch
+    # was introduced only to layer retained v1.4 scratch onto the same equations.
     branches = [
-        RuntimeLinearBranch(
+        LinearBranch(
             weights,
             heads,
             head_dim,
@@ -183,6 +169,8 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
     managed_weights = None
     managed_patcher = None
     if branch_weights == "resident":
+        # Explicit resident remains available for compatibility/ablation, but it is
+        # never selected automatically by the rollback path.
         managed_weights, managed_patcher = make_managed_branch_patcher(
             branch_weights_by_block, model)
 
@@ -230,7 +218,7 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
     )
     _log.info(
         "[vdn] %s applied: blocks=%d radius=%d chunk=%d anchors=%s rule=%s "
-        "branch=%s/%s buffers=%s backend=%s lora_mode=%s adapters=%s",
+        "branch=%s/%s buffers=transient baseline=v1.3.1 backend=%s lora_mode=%s adapters=%s",
         vdn_checkpoint,
         len(branches),
         cfg["radius"],
@@ -239,7 +227,6 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
         cfg["delta_rule"],
         os.path.basename(branch_path),
         branch_weights,
-        "retained" if retain else "transient",
         attention_backend,
         lora_mode,
         report,
@@ -269,18 +256,14 @@ class ApplyVDNH3:
                            "factors before H3 execution, and leaves pruned curve AdaLN "
                            "base weights untouched; fused INT8 fc2 remains native."}),
             "branch_weights": (["auto", "stream", "resident"], {
-                "default": "auto",
-                "tooltip": "auto: resident BF16 when the base-reserved VRAM budget "
-                           "exceeds 1.5x branch size + 4 GiB; otherwise stream and "
-                           "prefer native INT8 ConvRot when available. stream resolves "
-                           "one block at a time with safe one-block prefetch when buffers "
-                           "are retained. resident is a Comfy-managed additional model."}),
+                "default": "stream",
+                "tooltip": "Rollback baseline defaults to synchronous v1.3.1 stream. "
+                           "auto is kept for workflow compatibility and currently resolves "
+                           "to stream. resident remains an explicit ablation only."}),
             "retain_buffers": (["auto", "on", "off"], {
-                "default": "auto",
-                "tooltip": "auto retains VDN-owned scratch when the base-reserved VRAM "
-                           "budget is at least selected branch size + 10 GiB. Scratch is "
-                           "leased per execution; concurrent/nested runs use isolated "
-                           "transient storage."}),
+                "default": "off",
+                "tooltip": "Upstream v1.4 retained scratch/prefetch is quarantined while "
+                           "the regression is isolated. auto/on currently execute transient."}),
             "verbose": ("BOOLEAN", {"default": False}),
             "attention_backend": (["grouped", "flex"], {
                 "default": "grouped",
@@ -322,8 +305,13 @@ class ApplyVDNH3Advanced:
                 "tooltip": "bypass uses VDN-owned PyTorch forward post-hooks and "
                            "never replaces module.forward or materializes projected "
                            "curve AdaLN base weights; fused INT8 fc2 stays native."}),
-            "branch_weights": (["auto", "stream", "resident"], {"default": "auto"}),
-            "retain_buffers": (["auto", "on", "off"], {"default": "auto"}),
+            "branch_weights": (["auto", "stream", "resident"], {
+                "default": "stream",
+                "tooltip": "Rollback baseline: auto is a compatibility alias for stream; "
+                           "resident must be selected explicitly."}),
+            "retain_buffers": (["auto", "on", "off"], {
+                "default": "off",
+                "tooltip": "Rollback baseline always uses transient v1.3.1 scratch."}),
             "verbose": ("BOOLEAN", {"default": False}),
             "attention_backend": (["grouped", "flex"], {"default": "grouped"}),
             "architecture_mode": (["checkpoint", "override"], {

@@ -6,6 +6,8 @@ from torch import nn
 from torch.nn import functional as F
 
 import comfy.model_patcher
+from comfy.weight_adapter.bypass import BypassForwardHook
+from comfy.weight_adapter.lora import LoRAAdapter
 
 from vdn_h3.apply import apply_adapters
 
@@ -66,7 +68,7 @@ def _converted(dense, rank, out, scale=1.0):
     }
 
 
-def test_curve_bypass_uses_native_projected_patches_not_weight_wrappers(tmp_path):
+def test_curve_bypass_uses_projected_post_hook_not_native_patches(tmp_path):
     torch.manual_seed(421)
     table = torch.randn(9, 3)
     dense, rank, out = 7, 2, 6
@@ -83,21 +85,24 @@ def test_curve_bypass_uses_native_projected_patches_not_weight_wrappers(tmp_path
 
     weight_key = "diffusion_model.blocks.0.adaln_proj.linear.weight"
     bias_key = "diffusion_model.blocks.0.adaln_proj.linear.bias"
-    assert weight_key in patcher.patches
-    assert bias_key in patcher.patches
+    assert weight_key not in patcher.patches
+    assert bias_key not in patcher.patches
     assert patcher.weight_wrapper_patches == {}
-    # Curve-only bypass has nothing to post-forward-hook; its exact projected
-    # native terms are ordinary Comfy weight/bias patches.
-    assert patcher.injections == {}
-    assert report["runtime_lowvram"]["weight_wrappers"] == 0
-    assert report["runtime_lowvram"]["bias_wrappers"] == 0
-    assert report["runtime_lowvram"]["forward_hooks"] == 0
-    assert (
-        report["curve_adaln_projection"]["mode"]
-        == "bypass_native_projected_patch"
-    )
-    assert report["curve_adaln_projection"]["weight_patches"] == 1
-    assert report["curve_adaln_projection"]["bias_patches"] == 1
+    assert "vdn_lora" in patcher.injections
+    runtime = report["runtime_lowvram"]
+    assert runtime["weight_wrappers"] == 0
+    assert runtime["bias_wrappers"] == 0
+    assert runtime["forward_hooks"] == 1
+    assert runtime["projected_curve_runtime_targets"] == 1
+    assert runtime["projected_curve_weight_patches"] == 0
+    assert runtime["projected_curve_bias_patches"] == 0
+    assert runtime["runtime_preloaded_on_inject"] is True
+    assert runtime["managed_adapter_bytes"] > 0
+    projection = report["curve_adaln_projection"]
+    assert projection["mode"] == "bypass_post_forward_projected_residual"
+    assert projection["weight_patches"] == 0
+    assert projection["bias_patches"] == 0
+    assert projection["runtime_targets"] == 1
 
 
 def test_curve_merge_registers_normal_weight_and_bias_patches(tmp_path):
@@ -124,9 +129,10 @@ def test_curve_merge_registers_normal_weight_and_bias_patches(tmp_path):
     assert report["curve_adaln_projection"]["mode"] == "merge"
     assert report["curve_adaln_projection"]["weight_patches"] == 1
     assert report["curve_adaln_projection"]["bias_patches"] == 1
+    assert report["curve_adaln_projection"]["runtime_targets"] == 0
 
 
-def test_curve_bypass_projected_patch_matches_affine_dense_delta(tmp_path):
+def test_curve_bypass_projected_post_hook_matches_affine_dense_delta(tmp_path):
     torch.manual_seed(424)
     table = torch.randn(9, 3)
     dense, rank, out = 7, 2, 6
@@ -139,6 +145,7 @@ def test_curve_bypass_projected_patch_matches_affine_dense_delta(tmp_path):
     )
     base_weight = linear.weight.detach().clone()
     base_bias = linear.bias.detach().clone()
+    true_forward = linear.forward
     a = torch.randn(rank, dense)
     b = torch.randn(out, rank)
     strength = 0.625
@@ -159,10 +166,73 @@ def test_curve_bypass_projected_patch_matches_affine_dense_delta(tmp_path):
 
     patcher.patch_model(device_to=torch.device("cpu"))
     try:
-        got = F.linear(coords, linear.weight, linear.bias)
+        assert linear.forward == true_forward
+        assert torch.equal(linear.weight, base_weight)
+        assert torch.equal(linear.bias, base_bias)
+        got = linear(coords)
         assert torch.allclose(got, expected, atol=2e-5, rtol=2e-5)
     finally:
         patcher.unpatch_model(device_to=torch.device("cpu"))
 
+    assert linear.forward == true_forward
     assert torch.equal(linear.weight, base_weight)
     assert torch.equal(linear.bias, base_bias)
+
+
+def test_curve_bypass_coexists_with_external_comfy_bypass_chain(tmp_path, monkeypatch):
+    torch.manual_seed(425)
+    table = torch.randn(9, 3)
+    dense, rank, out = 7, 2, 6
+    basis = torch.randn(3, dense)
+    mean = torch.randn(dense)
+    stage = _stage(tmp_path, basis, mean)
+    patcher = _patcher(table, out)
+    linear = patcher.get_model_object(
+        "diffusion_model.blocks.0.adaln_proj.linear"
+    )
+    true_forward = linear.forward
+
+    vdn_a = torch.randn(rank, dense)
+    vdn_b = torch.randn(out, rank)
+    apply_adapters(
+        patcher,
+        {"turbo": {"blocks.0.adaln_proj.linear": (vdn_a, vdn_b, 1.0)}},
+        0.7,
+        mode="bypass",
+        stage_path=str(stage),
+    )
+
+    ext_down = torch.randn(2, 3)
+    ext_up = torch.randn(out, 2)
+    alpha = torch.tensor(float(ext_down.shape[0]))
+    adapter = LoRAAdapter(
+        set(), (ext_up, ext_down, alpha, None, None, None)
+    )
+    external = BypassForwardHook(linear, adapter, multiplier=0.4)
+    monkeypatch.setattr(
+        "comfy.model_management.get_torch_device", lambda: torch.device("cpu")
+    )
+
+    injection = patcher.injections["vdn_lora"][0]
+    coords = torch.randn(4, 3)
+    dense_input = mean + coords @ basis
+    vdn_delta = F.linear(F.linear(dense_input, vdn_a), vdn_b) * 0.7
+    ext_delta = F.linear(F.linear(coords, ext_down), ext_up) * 0.4
+    base = true_forward(coords)
+
+    external.inject()
+    external_forward = linear.forward
+    injection.inject(patcher)
+    try:
+        assert linear.forward == external_forward
+        assert torch.allclose(
+            linear(coords), base + ext_delta + vdn_delta, atol=2e-5, rtol=2e-5
+        )
+        injection.eject(patcher)
+        assert linear.forward == external_forward
+        assert torch.allclose(linear(coords), base + ext_delta, atol=2e-5, rtol=2e-5)
+    finally:
+        injection.eject(patcher)
+        external.eject()
+
+    assert linear.forward == true_forward

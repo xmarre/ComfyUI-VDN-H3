@@ -334,7 +334,7 @@ def make_vdn_forward(attn, state, block_index):
             vc = AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0))
             softmax_out = optimized_attention(
                 qc, kc, vc, heads, mask=None, skip_reshape=True,
-                transformer_options=transformer_options).squeeze(0)
+                transformer_options=transformer_options).squeeze(0).reshape(s, heads, head_dim)
 
         del q, k, v, q_raw, k_raw
         weights = state.weights_on(block_index, device, dtype)

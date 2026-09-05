@@ -8,20 +8,27 @@ and not ``ModelPatcher.weight_function``. VDN therefore never replaces or
 splices ``module.forward`` and cannot participate in another provider's mutable
 forward-wrapper linked list.
 
-This split is deliberate for quantized MiniMax-H3. The v1.5.0 weight-wrapper
-path forced custom quantized layers through a copied/dequantized weight path and
-hard-aborted in the production stacked-adapter workflow. v1.5.1 restored the old
-mutable-forward bypass chain, but the same real RTX PRO 6000 workflow still
-hard-aborted at the first H3 evaluation. VDN now stays out of both mechanisms:
-the native quantized base forward runs unchanged, an independently managed Comfy
-runtime adapter may wrap that forward if it wants to, and VDN adds its exact
-low-rank residual after the module returns.
+For pruned/curve MiniMax-H3, bypass mode also keeps the projected AdaLN updates
+out of the base parameter tree. The exact affine projection (basis + mean) is
+computed once on CPU, then the resulting low-rank curve-coordinate residual and
+constant bias are added by the same post-forward mechanism. This is deliberate:
+materializing the projected curve terms as native weight/bias patches changes the
+execution/storage path of the pruned base before the first attention projection.
+The production RTX PRO 6000 trace that invalidated the first v1.5.2 candidate
+reported the CUDA fault at the first ordinary VDN post-hook, but that hook runs
+after the module forward; the preceding VDN-specific operation in the block was
+the materialized curve-AdaLN update. Bypass now leaves those base parameters
+untouched as well.
+
+All runtime adapter factors are staged onto the compute device when the
+``PatcherInjection`` is injected. The first H3 forward therefore performs no VDN
+adapter H2D transfer and cannot use a transfer merely as the asynchronous CUDA
+error-reporting boundary. Unexpected device/dtype changes still have a synchronous
+fallback conversion for correctness.
 
 Fused INT8 ``mlp.fc2`` targets whose H3 fast path bypasses ``module.forward``
-remain ordinary Comfy weight patches. Full-width AdaLN LoRAs on curve/pruned H3
-bases remain projected once through the exact pruning affine (basis + mean), with
-the resulting native curve weight and constant-bias terms owned by normal Comfy
-patches in both modes.
+remain ordinary Comfy weight patches. In ``merge`` mode, projected curve-AdaLN
+weight/bias terms also remain ordinary Comfy patches.
 """
 from __future__ import annotations
 
@@ -34,12 +41,14 @@ import torch
 import torch.nn.functional as F
 
 import comfy.lora
+import comfy.model_management
 import comfy.patcher_extension
 import comfy.utils
 
 from vdn_h3.curve_affine import find_curve_affine, project_curve_terms
 
 _log = logging.getLogger("comfy.vdn")
+_FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
 
 
 def _is_adaln(module: str) -> bool:
@@ -113,7 +122,7 @@ def _native_patch_adapter(new_model, converted, strength: float) -> int:
 
 
 def _native_patch_projected_curve(new_model, terms_by_module, bias_terms_by_module):
-    """Apply projected curve LoRAs + their constant terms through normal patches."""
+    """Apply projected curve LoRAs + constants through normal patches (merge only)."""
     weight_patches = 0
     bias_patches = 0
     state_keys = set(new_model.model.state_dict().keys())
@@ -169,24 +178,68 @@ def _int8_fused_fc2(dm, modules):
     return fused
 
 
-class _PostForwardLoRA:
-    """Exact additive LoRA residual without replacing ``module.forward``.
+def _tensor_bytes(tensor: torch.Tensor) -> int:
+    return int(tensor.numel()) * int(tensor.element_size())
 
-    All terms for one module are fused into one down/up pair per active
-    device/dtype. Source tensors stay in their checkpoint-owned representation;
-    device copies are cached only while the PatcherInjection is active and are
-    dropped on eject/replacement.
+
+def _runtime_source_bytes(terms_by_module, bias_terms_by_module) -> int:
+    total = 0
+    for terms in terms_by_module.values():
+        for down, up, _scale in terms:
+            total += _tensor_bytes(down) + _tensor_bytes(up)
+    for terms in bias_terms_by_module.values():
+        for offset, _scale in terms:
+            total += _tensor_bytes(offset)
+    return total
+
+
+def _module_compute_device_dtype(module, fallback_dtype: torch.dtype):
+    device = torch.device(comfy.model_management.get_torch_device())
+    dtype = getattr(getattr(module, "weight", None), "dtype", None)
+    if dtype not in _FLOAT_DTYPES:
+        dtype = fallback_dtype if fallback_dtype in _FLOAT_DTYPES else torch.bfloat16
+    return device, dtype
+
+
+class _PostForwardLoRA:
+    """Exact additive low-rank residual without replacing ``module.forward``.
+
+    ``terms`` are ``(down, up, scale)`` factors. ``bias_terms`` are optional
+    ``(offset, scale)`` constants used by the exact pruned-AdaLN affine projection.
+    Source tensors remain CPU/checkpoint-owned. Device copies are created at
+    injection time for the module's normal compute device/dtype and dropped on
+    eject/replacement. A synchronous fallback handles an unexpected activation
+    device/dtype without relying on an asynchronous H2D copy inside the first H3
+    forward.
     """
 
-    def __init__(self, terms):
+    def __init__(self, terms, bias_terms=()):
         self.terms = tuple(
             (down.detach(), up.detach(), float(scale))
             for down, up, scale in terms
         )
+        self.bias_terms = tuple(
+            (offset.detach(), float(scale))
+            for offset, scale in bias_terms
+        )
+        if not self.terms and not self.bias_terms:
+            raise RuntimeError("VDN post-forward hook has no adapter terms")
         self._cache = {}
 
-    def _compiled_weights(self, x: torch.Tensor):
-        key = (x.device.type, x.device.index, x.dtype)
+    def _fallback_dtype(self):
+        for down, up, _scale in self.terms:
+            if down.dtype in _FLOAT_DTYPES:
+                return down.dtype
+            if up.dtype in _FLOAT_DTYPES:
+                return up.dtype
+        for offset, _scale in self.bias_terms:
+            if offset.dtype in _FLOAT_DTYPES:
+                return offset.dtype
+        return torch.bfloat16
+
+    def _compile(self, device, dtype):
+        device = torch.device(device)
+        key = (device.type, device.index, dtype)
         cached = self._cache.get(key)
         if cached is not None:
             return cached
@@ -194,19 +247,45 @@ class _PostForwardLoRA:
         downs = []
         ups = []
         for down, up, scale in self.terms:
-            down_active = down.to(device=x.device, dtype=x.dtype, non_blocking=True)
-            up_active = up.to(device=x.device, dtype=x.dtype, non_blocking=True)
+            # Blocking copies are intentional. Injection is the ownership boundary;
+            # the model forward should not become an H2D synchronization/error probe.
+            down_active = down.to(device=device, dtype=dtype, non_blocking=False)
+            up_active = up.to(device=device, dtype=dtype, non_blocking=False)
             if scale != 1.0:
                 up_active = up_active * scale
             downs.append(down_active)
             ups.append(up_active)
 
-        if not downs:
-            raise RuntimeError("VDN post-forward LoRA hook has no adapter terms")
-        down_cat = downs[0] if len(downs) == 1 else torch.cat(downs, dim=0)
-        up_cat = ups[0] if len(ups) == 1 else torch.cat(ups, dim=1)
-        self._cache[key] = (down_cat, up_cat)
-        return down_cat, up_cat
+        down_cat = None
+        up_cat = None
+        if downs:
+            down_cat = downs[0] if len(downs) == 1 else torch.cat(downs, dim=0)
+            up_cat = ups[0] if len(ups) == 1 else torch.cat(ups, dim=1)
+
+        bias = None
+        for offset, scale in self.bias_terms:
+            active = offset.to(device=device, dtype=dtype, non_blocking=False)
+            if scale != 1.0:
+                active = active * scale
+            bias = active if bias is None else bias + active
+
+        cached = (down_cat, up_cat, bias)
+        self._cache[key] = cached
+        return cached
+
+    def prepare(self, module):
+        device, dtype = _module_compute_device_dtype(module, self._fallback_dtype())
+        self._compile(device, dtype)
+
+    def _weights_for(self, x: torch.Tensor):
+        key = (x.device.type, x.device.index, x.dtype)
+        cached = self._cache.get(key)
+        if cached is None:
+            # Unexpected mixed-dtype/device execution remains supported, but keep the
+            # conversion synchronous so allocator errors are reported at this exact
+            # ownership boundary rather than being deferred into later kernels.
+            cached = self._compile(x.device, x.dtype)
+        return cached
 
     def __call__(self, module, inputs, output):
         if not isinstance(output, torch.Tensor):
@@ -220,8 +299,14 @@ class _PostForwardLoRA:
                 f"{type(module).__name__} to be a Tensor"
             )
         x = inputs[0]
-        down, up = self._compiled_weights(x)
-        delta = F.linear(F.linear(x, down), up)
+        down, up, bias = self._weights_for(x)
+        delta = None
+        if down is not None:
+            delta = F.linear(F.linear(x, down), up)
+        if bias is not None:
+            delta = bias if delta is None else delta + bias
+        if delta is None:
+            return output
         return output + delta
 
     def clear(self):
@@ -243,12 +328,19 @@ def _remove_post_forward_registration(registration):
         plan.clear()
 
 
-def _install_post_forward_injection(new_model, dm, terms_by_module):
-    if not terms_by_module:
+def _install_post_forward_injection(
+    new_model,
+    dm,
+    terms_by_module,
+    bias_terms_by_module=None,
+):
+    bias_terms_by_module = bias_terms_by_module or {}
+    paths = sorted(set(terms_by_module) | set(bias_terms_by_module))
+    if not paths:
         return 0
 
     plans = []
-    for path in sorted(terms_by_module):
+    for path in paths:
         module = comfy.utils.get_attr(dm, path)
         register = getattr(module, "register_forward_hook", None)
         if not callable(register):
@@ -256,7 +348,14 @@ def _install_post_forward_injection(new_model, dm, terms_by_module):
                 f"VDN bypass target {path!r} ({type(module).__name__}) does not "
                 "support PyTorch forward hooks"
             )
-        plans.append((path, module, _PostForwardLoRA(terms_by_module[path])))
+        plans.append((
+            path,
+            module,
+            _PostForwardLoRA(
+                terms_by_module.get(path, ()),
+                bias_terms_by_module.get(path, ()),
+            ),
+        ))
 
     owner = new_model.model
     token = object()
@@ -273,6 +372,10 @@ def _install_post_forward_injection(new_model, dm, terms_by_module):
             handles = []
             hook_plans = [plan for _, _, plan in plans]
             try:
+                # Stage every adapter tensor before registering any hook. If a copy
+                # fails, no partial runtime adapter topology becomes visible.
+                for _, module, plan in plans:
+                    plan.prepare(module)
                 for _, module, plan in plans:
                     handles.append(module.register_forward_hook(plan))
             except Exception:
@@ -318,7 +421,7 @@ def apply_adapters(
     stage_path=None,
     verbose=False,
 ):
-    """Apply released VDN adapters through merge or forward-post-hook bypass."""
+    """Apply released VDN adapters through merge or non-mutating runtime bypass."""
     if mode not in ("merge", "bypass"):
         raise ValueError(
             f"VDN lora_mode must be 'merge' or 'bypass', got {mode!r}"
@@ -330,6 +433,7 @@ def apply_adapters(
     report = {}
     curve_terms = {}
     runtime_terms = defaultdict(list)
+    runtime_bias_terms = defaultdict(list)
 
     for name, converted in converted_by_name.items():
         s = float(per_name.get(name, 1.0) if per_name is not None else strength)
@@ -423,34 +527,54 @@ def apply_adapters(
 
     curve_weight_patches = 0
     curve_bias_patches = 0
+    curve_runtime_targets = 0
     if projected_curve or curve_bias_terms:
-        curve_weight_patches, curve_bias_patches = _native_patch_projected_curve(
-            new_model,
-            projected_curve,
-            curve_bias_terms,
-        )
+        if mode == "merge":
+            curve_weight_patches, curve_bias_patches = _native_patch_projected_curve(
+                new_model,
+                projected_curve,
+                curve_bias_terms,
+            )
+        else:
+            for module, terms in projected_curve.items():
+                runtime_terms[module].extend(terms)
+            for module, terms in curve_bias_terms.items():
+                runtime_bias_terms[module].extend(terms)
+            curve_runtime_targets = len(
+                set(projected_curve) | set(curve_bias_terms)
+            )
 
     if mode == "bypass":
         forward_hook_modules = _install_post_forward_injection(
-            new_model, dm, runtime_terms
+            new_model,
+            dm,
+            runtime_terms,
+            runtime_bias_terms,
         )
         runtime_term_count = sum(len(terms) for terms in runtime_terms.values())
+        runtime_bias_count = sum(len(terms) for terms in runtime_bias_terms.values())
         runtime_report = {
             "mode": "post_forward_hook_bypass",
             "forward_hooks": forward_hook_modules,
             "pytorch_forward_post_hooks": forward_hook_modules,
             "runtime_terms": runtime_term_count,
+            "runtime_bias_terms": runtime_bias_count,
+            "runtime_preloaded_on_inject": True,
             "mutable_forward_wrappers": 0,
             "module_forward_untouched": True,
             "weight_wrappers": 0,
             "bias_wrappers": 0,
-            "managed_adapter_bytes": 0,
+            "managed_adapter_bytes": _runtime_source_bytes(
+                runtime_terms,
+                runtime_bias_terms,
+            ),
             "delta_buffer_limit_bytes": 0,
             "owner_key": None,
             "stack_safe_cross_provider": True,
             "cross_provider_forward_chain_independent": True,
-            "projected_curve_weight_patches": curve_weight_patches,
-            "projected_curve_bias_patches": curve_bias_patches,
+            "projected_curve_runtime_targets": curve_runtime_targets,
+            "projected_curve_weight_patches": 0,
+            "projected_curve_bias_patches": 0,
         }
         report["runtime_bypass"] = runtime_report
         # Preserve the v1.5.0 report key for callers/log parsers while making the
@@ -461,10 +585,12 @@ def apply_adapters(
         report["curve_adaln_projection"] = {
             "source": affine.source,
             "mode": (
-                "merge" if mode == "merge" else "bypass_native_projected_patch"
+                "merge" if mode == "merge"
+                else "bypass_post_forward_projected_residual"
             ),
             "weight_patches": curve_weight_patches,
             "bias_patches": curve_bias_patches,
+            "runtime_targets": curve_runtime_targets,
             "dense_width": int(affine.mean.shape[0]),
             "curve_width": int(affine.basis.shape[0]),
         }

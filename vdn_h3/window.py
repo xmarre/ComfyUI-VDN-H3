@@ -50,6 +50,13 @@ def window_softmax_grouped(query, key, value, video_start, video_end,
     widened by the anchor frames per `anchor_frames` (official semantics: "columns"
     makes frames 0 and F-1 visible to every query, "rows" makes those two frames'
     queries see everything, "both" is exact on both sides).
+
+    ``transformer_options`` is accepted for API compatibility only. VDN local windows
+    intentionally do not consume model-level ``optimized_attention_override`` hooks.
+    The released/v1.3.1 path was validated with exact SDPA here; approximate Sage or
+    quantized attention overrides remain confined to the base model's dense-attention
+    paths. This separation matters for the 8-step DMD stages, where small local-window
+    attention changes are amplified across the denoising trajectory.
     """
     heads, head_dim = query.shape[1], query.shape[2]
     out = torch.empty_like(query)
@@ -103,26 +110,17 @@ def window_softmax_grouped(query, key, value, video_start, video_end,
 
 
 def _sdpa(q_rows, k_rows, v_rows, scale, transformer_options=None):
-    """[rows, H, d] x [keys, H, d] -> [rows, H, d] via one dense attention.
+    """[rows, H, d] x [keys, H, d] -> [rows, H, d] through exact SDPA.
 
-    With transformer options the call goes through ComfyUI's dispatched
-    attention, so any optimized_attention_override on the model (e.g. a sage
-    patch) applies to the window groups exactly as it does to the base model's
-    dense attention. The dispatched functions scale by head_dim ** -0.5
-    internally, which is the `scale` the caller passes. Without them (unit
-    tests, CPU) raw SDPA keeps the path dependency-free."""
-    if transformer_options is not None:
-        from comfy.ldm.modules import attention as comfy_attention
-        rows, heads, dim = q_rows.shape
-        out = comfy_attention.optimized_attention(
-            q_rows.reshape(1, rows, heads * dim),
-            k_rows.reshape(1, -1, heads * dim),
-            v_rows.reshape(1, -1, heads * dim),
-            heads, transformer_options=transformer_options)
-        return out.reshape(rows, heads, dim)
-    # No override: still dispatch through comfy's backend-priority chain
-    # (flash -> cuDNN -> mem-efficient), since Windows torch builds ship without
-    # the flash kernel and raw F.sdpa lands on the slow mem-efficient backend.
+    ``transformer_options`` is deliberately ignored. In v1.3.1 and upstream v1.4.x,
+    VDN's grouped local windows stayed on exact SDPA even when the surrounding model
+    had a Sage/Kitchen ``optimized_attention_override``. Passing those overrides into
+    VDN windows changes the trained hybrid operator and was a regression in this fork.
+    """
+    del transformer_options
+    # Dispatch only through Comfy's exact SDPA backend-priority chain
+    # (flash -> cuDNN -> mem-efficient). Do not route through optimized_attention,
+    # because that consumes model-level approximate/quantized overrides.
     try:
         from comfy.ops import scaled_dot_product_attention as comfy_sdpa
     except ImportError:                      # unit tests run without comfy on path

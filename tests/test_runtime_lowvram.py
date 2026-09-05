@@ -63,7 +63,8 @@ def test_bypass_apply_uses_injection_and_never_weight_wrappers(monkeypatch):
     assert runtime["module_forward_untouched"] is True
     assert runtime["weight_wrappers"] == 0
     assert runtime["bias_wrappers"] == 0
-    assert runtime["managed_adapter_bytes"] == 0
+    assert runtime["runtime_preloaded_on_inject"] is True
+    assert runtime["managed_adapter_bytes"] == a.numel() * a.element_size() + b.numel() * b.element_size()
     assert runtime["owner_key"] is None
     assert runtime["stack_safe_cross_provider"] is True
     assert runtime["cross_provider_forward_chain_independent"] is True

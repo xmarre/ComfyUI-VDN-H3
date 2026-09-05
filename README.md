@@ -4,7 +4,9 @@
 
 **[中文](README_ZH.md)**
 
-A ComfyUI port of the released [OpenVDN VDN-H3](https://github.com/OpenVDN/vdn-minimax-h3) hybrid-attention architecture for ComfyUI's native MiniMax-H3 model.
+A ComfyUI port of the released [OpenVDN VDN-H3](https://github.com/OpenVDN/vdn-minimax-h3) hybrid-attention architecture for ComfyUI's native MiniMax-H3 model. This xmarre fork tracks the original [Saganaki22 ComfyUI port](https://github.com/Saganaki22/ComfyUI-VDN-H3) while adding stricter Comfy lifecycle ownership and the external-sequence API 2 used by Flow-Aligned Regenerate mixed-grid Continuum.
+
+**v1.5.0 status:** the API 2 path, streamed INT8-ConvRot branch, retained buffers, runtime LoRA bypass, grouped attention, AIMDO compiler guard, Spectrum/DiffAid/Untwist composition and multi-boundary Continuum execution were validated together on an RTX Pro 6000. The Flow-side one-token suffix DC bridge removed the remaining visible handoff flash. This does not turn unrelated Advanced-node ablations into validated defaults.
 
 VDN-H3 keeps exact softmax attention over a local frame window and uses a bidirectional Video Delta Attention branch for temporal context outside that window. This repository loads the released VDN stage directories directly and applies their branch weights and adapters without modifying ComfyUI core files.
 
@@ -32,7 +34,7 @@ Clone the node under `ComfyUI/custom_nodes/` and restart ComfyUI:
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/Saganaki22/ComfyUI-VDN-H3
+git clone https://github.com/xmarre/ComfyUI-VDN-H3
 ```
 
 Download an official VDN stage directory under `ComfyUI/models/vdn/`, preserving its directory structure:
@@ -117,7 +119,7 @@ This restores the low-VRAM adapter option without reintroducing the cross-provid
 
 For quantized/fused MiniMax-H3 modules, Comfy's cast path remains authoritative. A runtime weight wrapper can cause a patched INT8 layer to use a dequantized compute fallback for that invocation instead of the fused INT8 kernel. That trades speed for avoiding eager patched-weight materialization; measure it on the actual base and workflow rather than assuming either mode is universally cheaper.
 
-**Output note:** historical VDN bypass measurements used a different activation-level forward-hook implementation and showed quality differences on the 8-step DMD stage. They do not establish the numerical behavior of this weight-level runtime mode. Until matched GPU renders are complete, use `merge` as the Stage-DMD reference path and treat runtime `bypass` as a low-VRAM path requiring real-render validation.
+**Output note:** historical VDN bypass measurements used a different activation-level forward-hook implementation and showed quality differences on the 8-step DMD stage. They do not establish the numerical behavior of this weight-level runtime mode. The integrated RTX Pro 6000 mixed-grid Continuum validation completed successfully with runtime `bypass`. `merge` remains the conservative numerical reference when isolating adapter behavior, and other bases/strengths/backends should not be assumed equivalent without their own comparison.
 
 ## Curve/pruned MiniMax-H3 bases
 
@@ -222,7 +224,7 @@ Ownership rules are explicit:
 
 `retain_buffers=off` uses transient allocation behavior. `auto` applies the selected branch size + 10 GiB headroom rule to the same effective free-VRAM budget after reserving still-unloaded base-model bytes.
 
-CPU tests require retained and transient scan/window/complete-linear-branch paths to match the reference path exactly. Real CUDA allocation and speed still require production GPU validation.
+CPU tests require retained and transient scan/window/complete-linear-branch paths to match the reference path exactly. The released v1.5.0 integrated CUDA path has also been exercised with `branch_weights=auto` resolving to streamed INT8-ConvRot and `retain_buffers=auto` resolving to retained buffers; this is an interoperability validation, not a universal speed claim.
 
 ## Composition and lifecycle
 

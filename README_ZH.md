@@ -4,7 +4,9 @@
 
 **[English](README.md)**
 
-这是 [OpenVDN VDN-H3](https://github.com/OpenVDN/vdn-minimax-h3) 发布版混合注意力架构在 ComfyUI 原生 MiniMax-H3 模型上的移植。
+这是 [OpenVDN VDN-H3](https://github.com/OpenVDN/vdn-minimax-h3) 发布版混合注意力架构在 ComfyUI 原生 MiniMax-H3 模型上的移植。xmarre fork 继续跟踪原始 [Saganaki22 ComfyUI 移植](https://github.com/Saganaki22/ComfyUI-VDN-H3)，并加入更严格的 Comfy 生命周期所有权以及 Flow-Aligned Regenerate mixed-grid Continuum 使用的 external-sequence API 2。
+
+**v1.5.0 状态：** API 2、streamed INT8-ConvRot branch、retained buffers、runtime LoRA bypass、grouped attention、AIMDO compiler guard、Spectrum/DiffAid/Untwist 组合以及多边界 Continuum 已在 RTX Pro 6000 上完成集成验证。Flow 侧单 token suffix DC bridge 消除了剩余的可见 handoff 闪烁。这不代表 Advanced 节点中的其他消融设置自动成为已验证默认值。
 
 VDN-H3 在局部帧窗口内保留精确 softmax 注意力，并用双向 Video Delta Attention 线性分支覆盖窗口外的长距离时序上下文。本仓库直接读取官方 VDN stage 目录，不修改 ComfyUI 核心文件。
 
@@ -30,7 +32,7 @@ Advanced 节点默认 `architecture_mode=checkpoint`。只有显式选择 `overr
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/Saganaki22/ComfyUI-VDN-H3
+git clone https://github.com/xmarre/ComfyUI-VDN-H3
 ```
 
 保持官方目录结构下载到 `ComfyUI/models/vdn/`：
@@ -101,7 +103,7 @@ hf download OpenVDN/vdn-minimax-h3 \
 
 对 fused/quantized MiniMax-H3，Comfy cast 路径仍是唯一权威。runtime wrapper 可能使对应 INT8 layer 本次调用走反量化 compute fallback，因此必须在真实 workflow 上测量速度/显存。
 
-历史 bypass 测试使用的是旧 activation-level forward-hook 实现，不能代表新的 weight-level runtime 路径。完成匹配 GPU render 前，Stage-DMD 质量对照仍以 `merge` 为 reference。
+历史 bypass 测试使用的是旧 activation-level forward-hook 实现，不能代表新的 weight-level runtime 路径。v1.5.0 的 RTX Pro 6000 mixed-grid Continuum 集成验证已成功使用新的 runtime `bypass`；在单独隔离 adapter 数值行为时，`merge` 仍是保守 reference。
 
 ## Curve / pruned MiniMax-H3
 

@@ -1,4 +1,10 @@
-"""VDN-H3 hybrid-attention integration for ComfyUI MiniMax-H3."""
+"""VDN-H3 hybrid-attention integration for ComfyUI MiniMax-H3.
+
+The normal/native-sequence execution in this module intentionally follows the
+known-good v1.3.1 topology: synchronous branch-weight resolution, fresh raw-QKV
+copies, eager LinearBranch state, and the original grouped-window implementation.
+Newer Flow external-sequence contracts and current Comfy compatibility remain.
+"""
 from __future__ import annotations
 
 import collections
@@ -16,9 +22,8 @@ import comfy.quant_ops
 from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention
 from comfy.patcher_extension import WrappersMP
 
-from vdn_h3.runtime import RuntimeBufferOwner
 from vdn_h3.spec import resolve_branch_weights
-from vdn_h3.window import full_coverage, window_bounds
+from vdn_h3.window import full_coverage, window_bounds, window_softmax_grouped
 
 _log = logging.getLogger("comfy.vdn")
 _seen = collections.OrderedDict()
@@ -63,7 +68,11 @@ class VDNLayout:
 
 
 class VDNState:
-    """One Apply-VDN application's config, branch ownership and runtime resources."""
+    """One Apply-VDN application's config and branch ownership.
+
+    ``retain_buffers`` stays in the constructor only for workflow/API compatibility.
+    The rollback path deliberately owns no retained scratch or side-stream prefetch.
+    """
 
     def __init__(self, name, cfg, branches, num_heads, head_dim,
                  managed_weights=None, retain_buffers=False):
@@ -74,8 +83,8 @@ class VDNState:
         self.head_dim = head_dim
         self.managed_weights = managed_weights
         self.softmax_backend = "grouped"
-        self.runtime = RuntimeBufferOwner(retain_buffers)
         self._layout = contextvars.ContextVar(f"vdn_layout_{id(self)}", default=None)
+        self._retain_requested = bool(retain_buffers)
 
     @property
     def layout(self):
@@ -83,7 +92,8 @@ class VDNState:
 
     @property
     def retain_buffers(self):
-        return self.runtime.retain
+        # Upstream v1.4 retained execution is quarantined by this rollback branch.
+        return False
 
     def _stream_weights(self, index, device, dtype):
         return resolve_branch_weights(self.branches[index].w, device, dtype)
@@ -91,26 +101,9 @@ class VDNState:
     def weights_on(self, index, device, dtype):
         if self.managed_weights is not None:
             return self.managed_weights.weights_on(index, device, dtype)
-
-        resources = self.runtime.current()
-        if (resources is None or not resources.retain
-                or torch.device(device).type != "cuda"):
-            return self._stream_weights(index, device, dtype)
-
-        placement = (str(torch.device(device)), dtype)
-        prefetch_key = (index, *placement)
-        hit = resources.prefetch_take(prefetch_key)
-        if hit is None:
-            hit = self._stream_weights(index, device, dtype)
-
-        next_index = (index + 1) % len(self.branches)
-        if self.branches[next_index] is not None:
-            next_key = (next_index, *placement)
-            resources.prefetch_request(
-                next_key,
-                lambda i=next_index, d=device, t=dtype: self._stream_weights(i, d, t),
-            )
-        return hit
+        # v1.3.1 semantics: resolve the current block synchronously on the caller's
+        # execution stream. No worker, producer stream, event or lookahead state.
+        return self._stream_weights(index, device, dtype)
 
 
 def layout_from_payload(payload, x, context, cfg):
@@ -139,34 +132,33 @@ def layout_from_payload(payload, x, context, cfg):
 
 
 def make_layout_wrapper(state):
+    """Publish execution-local layout without any v1.4 runtime-buffer lease."""
     def wrap(executor, *args, **kwargs):
         layout = layout_from_payload(
             kwargs.get("minimax_payload"), args[0], args[2], state.cfg)
-        with state.runtime.execution():
-            token = state._layout.set(layout)
-            _once(
-                ("layout", layout.seq_len, layout.num_frames, layout.tokens_per_frame,
-                 tuple(layout.bounds), layout.anchor_frames, state.retain_buffers),
-                f"layout: seq {layout.seq_len}, video [{layout.video_start}, "
-                f"{layout.video_end}), F={layout.num_frames}, S={layout.tokens_per_frame}, "
-                f"window={'dense' if layout.full_cover else layout.bounds[0]}, "
-                f"buffers={'retained' if state.retain_buffers else 'transient'}",
-            )
-            try:
-                return executor(*args, **kwargs)
-            except comfy.model_management.InterruptProcessingException:
-                # All persistent scratch belongs to this VDNState, so a cancelled
-                # execution can release it without touching another node/model.
-                state.runtime.clear()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                raise
-            finally:
-                state._layout.reset(token)
+        token = state._layout.set(layout)
+        _once(
+            ("layout", layout.seq_len, layout.num_frames, layout.tokens_per_frame,
+             tuple(layout.bounds), layout.anchor_frames, "v1.3.1-baseline"),
+            f"layout: seq {layout.seq_len}, video [{layout.video_start}, "
+            f"{layout.video_end}), F={layout.num_frames}, S={layout.tokens_per_frame}, "
+            f"window={'dense' if layout.full_cover else layout.bounds[0]}, "
+            "execution=v1.3.1-baseline/transient",
+        )
+        try:
+            return executor(*args, **kwargs)
+        except comfy.model_management.InterruptProcessingException:
+            # There is no VDN-owned retained GPU state in this execution mode.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            raise
+        finally:
+            state._layout.reset(token)
     return wrap
 
 
 def _base_attention(attn, x, rope_freqs, transformer_options):
+    """Dense fallback with the pre-Comfy-compiler MiniMax value-lifetime barrier."""
     transformer_options = transformer_options or {}
     s = x.shape[0]
     q, k, v = attn.qkv_proj(x).split(attn.heads * attn.head_dim, dim=-1)
@@ -187,6 +179,12 @@ def _base_attention(attn, x, rope_freqs, transformer_options):
     else:
         q = attn.q_norm(q.view(s, attn.heads, attn.head_dim))
         k = attn.k_norm(k.view(s, attn.heads, attn.head_dim))
+
+    # Comfy 5c23fb7b removed this clone from the native MiniMax path after adding
+    # compiler/malloc-graph machinery. VDN v1.3.1 explicitly kept it. Retain the
+    # old lifetime barrier inside VDN rather than depending on compiler allocation
+    # assumptions for a custom object-patched attention forward.
+    v = v.clone()
     q = AttentionTensorContainer(q.transpose(0, 1).unsqueeze(0))
     k = AttentionTensorContainer(k.transpose(0, 1).unsqueeze(0))
     v = AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0))
@@ -197,6 +195,7 @@ def _base_attention(attn, x, rope_freqs, transformer_options):
 
 
 def _external_reduced_sequence_active(transformer_options, layout, sequence_rows, rope_freqs):
+    """Validate current Flow API1/API2 contracts without changing baseline native math."""
     contract = transformer_options.get(VDN_EXTERNAL_SEQUENCE_KEY)
     if isinstance(contract, dict) and contract.get("api") == 2:
         if contract.get("mode") != VDN_EXTERNAL_SEQUENCE_MODE or contract.get("topology") != "mixed_grid_low_suffix":
@@ -205,7 +204,8 @@ def _external_reduced_sequence_active(transformer_options, layout, sequence_rows
                  "source_rows_per_frame", "prefix_rows_per_frame")
         if any(type(contract.get(name)) is not int for name in names):
             raise RuntimeError("VDN mixed-sequence counts must be integers")
-        native, actual, start, temporal, prefix, source_rows, prefix_rows = (contract[name] for name in names)
+        native, actual, start, temporal, prefix, source_rows, prefix_rows = (
+            contract[name] for name in names)
         if (native != layout.seq_len or actual != sequence_rows or start != layout.video_start
                 or temporal != layout.num_frames or source_rows != layout.tokens_per_frame
                 or not 0 < prefix < temporal or not 0 < source_rows < prefix_rows
@@ -253,8 +253,8 @@ def make_vdn_forward(attn, state, block_index):
         if layout is None or base_branch is None:
             return _base_attention(attn, x, rope_freqs, transformer_options)
 
-        # ModelPatcher clones share VDNState. Keep the small lazy backend selector on
-        # an execution-local shallow branch copy so simultaneous geometry cannot race.
+        # Keep the current clone/concurrency isolation for the tiny delta-backend
+        # selector. It does not change the equations or tensor execution path.
         branch = copy.copy(base_branch)
         branch._backend = None
         branch._backend_key = None
@@ -264,7 +264,8 @@ def make_vdn_forward(attn, state, block_index):
             transformer_options, layout, s, rope_freqs)
         if external_reduced:
             external_kind = (
-                "mixed" if transformer_options[VDN_EXTERNAL_SEQUENCE_KEY].get("api") == 2 else "reduced")
+                "mixed" if transformer_options[VDN_EXTERNAL_SEQUENCE_KEY].get("api") == 2
+                else "reduced")
             _once(
                 ("external-reduced", layout.seq_len, s),
                 f"external {external_kind} sequence {s}/{layout.seq_len}: using dense gated "
@@ -282,37 +283,17 @@ def make_vdn_forward(attn, state, block_index):
         q_raw_video = k_raw_video = v_video = None
         text_x = text_k_raw = text_v_raw = None
         if linear_active:
+            # Exact v1.3.1 lifetime/topology: independent fresh copies before the
+            # in-place Q/K RoPE path; no reusable activation scratch.
             a, b = layout.video_start, layout.video_end
-            resources = state.runtime.current()
-            text_rows = layout.text_len if branch.enable_text_state else 0
-            scratch = (
-                resources.activation_scratch(
-                    b - a, text_rows, heads, head_dim, device, dtype)
-                if resources is not None else None
-            )
-            if scratch is None:
-                q_raw_video = q_raw[a:b].clone()
-                k_raw_video = k_raw[a:b].clone()
-                v_video = v[a:b].clone()
-            else:
-                q_raw_video = scratch["q"]
-                k_raw_video = scratch["k"]
-                v_video = scratch["v"]
-                q_raw_video.copy_(q_raw[a:b])
-                k_raw_video.copy_(k_raw[a:b])
-                v_video.copy_(v[a:b])
-
+            q_raw_video = q_raw[a:b].clone()
+            k_raw_video = k_raw[a:b].clone()
+            v_video = v[a:b].clone()
             if branch.enable_text_state and layout.text_len:
                 ta, tb = layout.text_start, layout.text_start + layout.text_len
                 text_x = x[ta:tb]
-                if scratch is None:
-                    text_k_raw = k_raw[ta:tb].clone()
-                    text_v_raw = v[ta:tb].clone()
-                else:
-                    text_k_raw = scratch["tk"]
-                    text_v_raw = scratch["tv"]
-                    text_k_raw.copy_(k_raw[ta:tb])
-                    text_v_raw.copy_(v[ta:tb])
+                text_k_raw = k_raw[ta:tb].clone()
+                text_v_raw = v[ta:tb].clone()
 
         if rope_freqs is not None:
             q4 = q.view(1, s, heads, head_dim)
@@ -343,8 +324,10 @@ def make_vdn_forward(attn, state, block_index):
                         "[vdn] flex attention failed (%s); falling back to grouped SDPA "
                         "for this execution", exc)
             if backend != "flex":
-                from vdn_h3.retained import window_softmax_grouped_runtime
-                softmax_out = window_softmax_grouped_runtime(
+                # Restore the original v1.3.1 grouped path. The v1.4 retained helper
+                # used prebuilt index plans and reusable KV scratch; even with retention
+                # nominally disabled that was still a different execution topology.
+                softmax_out = window_softmax_grouped(
                     q, k, v, layout.video_start, layout.video_end,
                     layout.num_frames, layout.tokens_per_frame, layout.bounds,
                     head_dim ** -0.5, anchor_frames=cfg["anchor_frames"],

@@ -57,13 +57,11 @@ jobs:
           python -m compileall -q vdn_h3 tests tools
           pytest -q tests --timeout=120
           git diff --check
-      - name: Commit validated staging tree and remove staging helpers
+      - name: Commit and push validated non-workflow production files
         shell: bash
         run: |
           git config user.name xmarre
           git config user.email 54859656+xmarre@users.noreply.github.com
-          git add vdn_h3 tests pyproject.toml docs/UPSTREAM_RECONCILIATION.md RELEASE_NOTES.md .github/workflows/release.yml .github/workflows/publish_action.yml
-          git commit -m "Prepare VDN-H3 v1.5.0 release"
-          git rm .github/workflows/staging_release_v1_5.yml .github/staging_vdn_release.py
-          git commit -m "Remove staging release helpers"
+          git add vdn_h3 tests pyproject.toml docs/UPSTREAM_RECONCILIATION.md RELEASE_NOTES.md
+          git commit -m "Prepare VDN-H3 v1.5.0 runtime and release metadata"
           git push origin HEAD:staging/release-v1.5.0-20260905

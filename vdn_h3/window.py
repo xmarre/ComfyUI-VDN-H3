@@ -12,6 +12,8 @@ it needs no Triton and no torch.compile while keeping the exact same softmax
 partition (the official window_softmax_reference is the same arithmetic spelled as
 one SDPA per frame instead of per chunk).
 """
+import collections
+
 import torch
 import torch.nn.functional as F
 
@@ -135,7 +137,24 @@ def _sdpa(q_rows, k_rows, v_rows, scale, transformer_options=None):
 # ---------------------------------------------------------------- flex path --
 
 _FLEX = None
-_BM_CACHE = {}
+MAX_BLOCK_MASK_CACHE = 8
+_BM_CACHE = collections.OrderedDict()
+
+
+def _block_mask_cache_get(key):
+    hit = _BM_CACHE.get(key)
+    if hit is not None:
+        _BM_CACHE.move_to_end(key)
+    return hit
+
+
+def _block_mask_cache_put(key, value):
+    if key in _BM_CACHE:
+        _BM_CACHE.pop(key)
+    _BM_CACHE[key] = value
+    while len(_BM_CACHE) > MAX_BLOCK_MASK_CACHE:
+        _BM_CACHE.popitem(last=False)
+    return value
 
 
 def _build_window_tables(seq, video_start, video_end, num_frames,
@@ -178,8 +197,8 @@ def window_softmax_flex(query, key, value, video_start, video_end, num_frames,
     """The same window partition as window_softmax_grouped, executed as one fused
     FlexAttention kernel over the full sequence with a BlockMask -- the official
     release's softmax architecture, minus its FA4 backend. Needs torch.compile +
-    triton; the first call per sequence shape compiles (and the BlockMask is
-    cached per shape)."""
+    triton; the first call per sequence shape compiles and up to eight recent
+    BlockMasks are cached by full device/layout identity."""
     global _FLEX
     from torch.nn.attention.flex_attention import (create_block_mask,
                                                    flex_attention)
@@ -187,8 +206,8 @@ def window_softmax_flex(query, key, value, video_start, video_end, num_frames,
         _FLEX = torch.compile(flex_attention)
     seq = query.shape[0]
     ck = (seq, video_start, video_end, num_frames, tokens_per_frame,
-          anchor_frames, tuple(tuple(b) for b in bounds), query.device.type)
-    bm = _BM_CACHE.get(ck)
+          anchor_frames, tuple(tuple(b) for b in bounds), str(query.device))
+    bm = _block_mask_cache_get(ck)
     if bm is None:
         lo, hi = _build_window_tables(seq, video_start, video_end, num_frames,
                                       tokens_per_frame, bounds, query.device)
@@ -196,7 +215,7 @@ def window_softmax_flex(query, key, value, video_start, video_end, num_frames,
             _window_mask_mod(video_start, video_end, num_frames,
                              tokens_per_frame, lo, hi, anchor_frames),
             None, None, seq, seq, query.device, _compile=True)
-        _BM_CACHE[ck] = bm
+        _block_mask_cache_put(ck, bm)
     out = _FLEX(query.transpose(0, 1).unsqueeze(0),
                 key.transpose(0, 1).unsqueeze(0),
                 value.transpose(0, 1).unsqueeze(0),

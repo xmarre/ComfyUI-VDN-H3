@@ -1,210 +1,215 @@
-"""Regression tests for VDN bypass-hook reinjection and cross-provider teardown.
+"""Lifecycle regressions for VDN's non-mutating runtime bypass.
 
-ComfyUI's ModelPatcher can have several independently owned bypass injections on
-one module. Plain BypassForwardHook teardown is only safe under a global LIFO
-order, so VDN keeps its hooks inside the external chain and splices them out
-safely regardless of provider insertion/ejection order.
-
-These are the lifecycle invariants from the previously production-validated PR #1
-path. v1.5.1 restores this architecture after the v1.5.0 weight-wrapper path
-regressed a stacked VDN + runtime-DoRA quantized workflow.
+VDN must never replace ``module.forward``. Its low-residency LoRA residuals use
+PyTorch forward post-hooks whose handles are owned by one PatcherInjection.
+ModelPatcher clones share the inner model, so a new VDN generation replaces the
+old registered handles and stale clone ejection cannot remove the newer set.
 """
 from __future__ import annotations
-
-import types
 
 import torch
 import torch.nn as nn
 
 import comfy.model_management
-import comfy.patcher_extension
+import comfy.model_patcher
 from comfy.weight_adapter.bypass import BypassForwardHook
+from comfy.weight_adapter.lora import LoRAAdapter
 
-from vdn_h3.apply import _FrugalLoRA, _install_injection
-
-
-def _adapter():
-    up = torch.randn(8, 4)
-    down = torch.randn(4, 8) * 0.1
-    return _FrugalLoRA(set(), (up, down, torch.tensor(4.0)))
+from vdn_h3.apply import apply_adapters
 
 
-class _Patcher:
-    def __init__(self, model=None):
-        self.injections = {}
-        self.model = model if model is not None else types.SimpleNamespace()
-
-    def set_injections(self, key, value):
-        self.injections[key] = value
-
-    def inject_model(self):
-        for injections in self.injections.values():
-            for injection in injections:
-                injection.inject(self)
-
-    def eject_model(self):
-        # Deliberately mirrors the hazardous same-order provider teardown that the
-        # VDN splicing logic must survive.
-        for injections in self.injections.values():
-            for injection in injections:
-                injection.eject(self)
+class Diffusion(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(8, 8, bias=False)
+        self.use_adaln_curves = False
 
 
-def _fresh_module():
-    torch.manual_seed(0)
-    mod = nn.Linear(8, 8)
-    return mod, mod.forward
+class Root(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.diffusion_model = Diffusion()
+        self.device = torch.device("cpu")
 
 
-def _adapter_lora(hook, x):
-    up, down, _ = hook.adapter.weights
-    return torch.nn.functional.linear(
+def _base():
+    torch.manual_seed(901)
+    return comfy.model_patcher.ModelPatcher(
+        Root(), torch.device("cpu"), torch.device("cpu")
+    )
+
+
+def _term(seed, rank=3):
+    gen = torch.Generator().manual_seed(seed)
+    down = torch.randn(rank, 8, generator=gen)
+    up = torch.randn(8, rank, generator=gen)
+    return down, up
+
+
+def _apply(base, down, up, strength=1.0):
+    patcher = base.clone()
+    report = apply_adapters(
+        patcher,
+        {"default": {"linear": (down, up, 1.0)}},
+        strength,
+        mode="bypass",
+        stage_path=None,
+    )
+    return patcher, report
+
+
+def _delta(x, down, up, strength=1.0):
+    return strength * torch.nn.functional.linear(
         torch.nn.functional.linear(x, down), up
     )
 
 
-def _external_injection(hook):
-    return comfy.patcher_extension.PatcherInjection(
-        inject=lambda _patcher: hook.inject(),
-        eject=lambda _patcher: hook.eject(),
-    )
-
-
-def test_vdn_multiple_hooks_repeated_cycles_restore_true_forward(monkeypatch):
+def test_vdn_bypass_never_replaces_module_forward(monkeypatch):
     monkeypatch.setattr(
         comfy.model_management, "get_torch_device", lambda: torch.device("cpu")
     )
-    mod, true_fwd = _fresh_module()
-    hook_d = BypassForwardHook(mod, _adapter(), multiplier=1.0)
-    hook_t = BypassForwardHook(mod, _adapter(), multiplier=1.0)
-    patcher = _Patcher()
-    _install_injection(patcher, [hook_d, hook_t])
-    injection = patcher.injections["vdn_lora"][0]
+    base = _base()
+    module = base.model.diffusion_model.linear
+    true_forward = module.forward
+    down, up = _term(902)
+    vdn, report = _apply(base, down, up, 0.75)
+    injection = vdn.injections["vdn_lora"][0]
+    x = torch.randn(4, 8)
+    want = true_forward(x) + _delta(x, down, up, 0.75)
 
+    assert report["runtime_bypass"]["mode"] == "post_forward_hook_bypass"
+    assert report["runtime_bypass"]["mutable_forward_wrappers"] == 0
+    assert report["runtime_bypass"]["module_forward_untouched"] is True
+    assert module.forward == true_forward
+
+    injection.inject(vdn)
+    try:
+        assert module.forward == true_forward
+        assert torch.allclose(module(x), want, atol=1e-5, rtol=1e-5)
+    finally:
+        injection.eject(vdn)
+    assert module.forward == true_forward
+
+
+def test_clone_replacement_and_stale_eject_do_not_accumulate(monkeypatch):
+    monkeypatch.setattr(
+        comfy.model_management, "get_torch_device", lambda: torch.device("cpu")
+    )
+    base = _base()
+    module = base.model.diffusion_model.linear
+    true_forward = module.forward
+    down1, up1 = _term(903)
+    down2, up2 = _term(904)
+    first, _ = _apply(base, down1, up1, 1.0)
+    second, _ = _apply(base, down2, up2, 0.5)
+    inj1 = first.injections["vdn_lora"][0]
+    inj2 = second.injections["vdn_lora"][0]
     x = torch.randn(3, 8)
-    want = true_fwd(x) + _adapter_lora(hook_d, x) + _adapter_lora(hook_t, x)
 
-    for cycle in range(5):
-        injection.inject(patcher)
-        assert mod.forward == hook_d._bypass_forward, cycle
-        assert hook_d.original_forward == hook_t._bypass_forward, cycle
-        assert hook_t.original_forward == true_fwd, cycle
-        assert torch.allclose(mod(x), want, atol=1e-5), cycle
+    inj1.inject(first)
+    assert module.forward == true_forward
+    assert torch.allclose(
+        module(x), true_forward(x) + _delta(x, down1, up1), atol=1e-5
+    )
 
-        injection.eject(patcher)
-        assert mod.forward == true_fwd, cycle
-        assert hook_d.original_forward is None
-        assert hook_t.original_forward is None
+    # Same shared model, newer clone: this must replace, not stack.
+    inj2.inject(second)
+    want2 = true_forward(x) + _delta(x, down2, up2, 0.5)
+    assert module.forward == true_forward
+    assert torch.allclose(module(x), want2, atol=1e-5)
+
+    # Ejecting the stale generation must not tear down the current one.
+    inj1.eject(first)
+    assert module.forward == true_forward
+    assert torch.allclose(module(x), want2, atol=1e-5)
+
+    inj2.eject(second)
+    assert module.forward == true_forward
+    assert torch.allclose(module(x), true_forward(x), atol=1e-6)
 
 
-def _run_cross_provider_cycles(monkeypatch, vdn_first):
+def _external_hook(module, down, up, strength=1.0):
+    # Core Comfy LoRA bypass hook: this deliberately DOES mutate module.forward.
+    # VDN must coexist without becoming part of this linked list.
+    alpha = torch.tensor(float(down.shape[0]))
+    adapter = LoRAAdapter(set(), (up, down, alpha, None, None, None))
+    return BypassForwardHook(module, adapter, multiplier=float(strength))
+
+
+def _run_cross_provider(monkeypatch, external_first):
     monkeypatch.setattr(
         comfy.model_management, "get_torch_device", lambda: torch.device("cpu")
     )
-    mod, true_fwd = _fresh_module()
-    vdn_hook = BypassForwardHook(mod, _adapter(), multiplier=1.0)
-    external_hook = BypassForwardHook(mod, _adapter(), multiplier=1.0)
-    patcher = _Patcher()
-
-    if vdn_first:
-        _install_injection(patcher, [vdn_hook])
-        patcher.set_injections(
-            "external_runtime_lora", [_external_injection(external_hook)]
-        )
-    else:
-        patcher.set_injections(
-            "external_runtime_lora", [_external_injection(external_hook)]
-        )
-        _install_injection(patcher, [vdn_hook])
-
-    x = torch.randn(3, 8)
-    want = (
-        true_fwd(x)
-        + _adapter_lora(vdn_hook, x)
-        + _adapter_lora(external_hook, x)
-    )
-
-    for cycle in range(5):
-        patcher.inject_model()
-
-        # External provider is outermost in both insertion orders; VDN is safely
-        # spliced underneath it and above the true base forward.
-        assert mod.forward == external_hook._bypass_forward, cycle
-        assert external_hook.original_forward == vdn_hook._bypass_forward, cycle
-        assert vdn_hook.original_forward == true_fwd, cycle
-        assert torch.allclose(mod(x), want, atol=1e-5), cycle
-
-        patcher.eject_model()
-        assert mod.forward == true_fwd, cycle
-        assert vdn_hook.original_forward is None
-        assert external_hook.original_forward is None
-
-
-def test_cross_provider_forward_order_eject_vdn_first(monkeypatch):
-    _run_cross_provider_cycles(monkeypatch, vdn_first=True)
-
-
-def test_cross_provider_forward_order_eject_external_first(monkeypatch):
-    _run_cross_provider_cycles(monkeypatch, vdn_first=False)
-
-
-def test_live_vdn_replacement_under_external_hook(monkeypatch):
-    monkeypatch.setattr(
-        comfy.model_management, "get_torch_device", lambda: torch.device("cpu")
-    )
-    mod, true_fwd = _fresh_module()
-    shared_owner = types.SimpleNamespace()
-    first = BypassForwardHook(mod, _adapter(), multiplier=1.0)
-    second = BypassForwardHook(mod, _adapter(), multiplier=1.0)
-    external = BypassForwardHook(mod, _adapter(), multiplier=1.0)
-
-    patcher1 = _Patcher(shared_owner)
-    _install_injection(patcher1, [first])
-    inj1 = patcher1.injections["vdn_lora"][0]
-    inj1.inject(patcher1)
-    external.inject()
-
-    assert mod.forward == external._bypass_forward
-    assert external.original_forward == first._bypass_forward
-
-    patcher2 = _Patcher(shared_owner)
-    _install_injection(patcher2, [second])
-    inj2 = patcher2.injections["vdn_lora"][0]
-    inj2.inject(patcher2)
-
-    assert first.original_forward is None
-    assert mod.forward == external._bypass_forward
-    assert external.original_forward == second._bypass_forward
-    assert second.original_forward == true_fwd
-
+    base = _base()
+    module = base.model.diffusion_model.linear
+    true_forward = module.forward
+    vd, vu = _term(905)
+    ed, eu = _term(906)
+    vdn, _ = _apply(base, vd, vu, 0.6)
+    injection = vdn.injections["vdn_lora"][0]
+    external = _external_hook(module, ed, eu, 0.4)
     x = torch.randn(2, 8)
-    want = true_fwd(x) + _adapter_lora(second, x) + _adapter_lora(external, x)
-    assert torch.allclose(mod(x), want, atol=1e-5)
-
-    inj2.eject(patcher2)
-    assert mod.forward == external._bypass_forward
-    assert external.original_forward == true_fwd
-    external.eject()
-    assert mod.forward == true_fwd
-
-
-def test_cycle_detection_fails_closed(monkeypatch):
-    monkeypatch.setattr(
-        comfy.model_management, "get_torch_device", lambda: torch.device("cpu")
+    want = (
+        true_forward(x)
+        + _delta(x, ed, eu, 0.4)
+        + _delta(x, vd, vu, 0.6)
     )
-    mod, _ = _fresh_module()
-    external = BypassForwardHook(mod, _adapter(), multiplier=1.0)
-    external.inject()
-    external.original_forward = external._bypass_forward
 
-    vdn = BypassForwardHook(mod, _adapter(), multiplier=1.0)
-    patcher = _Patcher()
-    _install_injection(patcher, [vdn])
-    injection = patcher.injections["vdn_lora"][0]
+    if external_first:
+        external.inject()
+        external_forward = module.forward
+        injection.inject(vdn)
+    else:
+        injection.inject(vdn)
+        assert module.forward == true_forward
+        external.inject()
+        external_forward = module.forward
 
     try:
-        injection.inject(patcher)
-    except RuntimeError as exc:
-        assert "cyclic Comfy bypass-forward chain" in str(exc)
-    else:
-        raise AssertionError("cyclic bypass chain was accepted")
+        # VDN registration never changes the external provider's forward object.
+        assert module.forward == external_forward
+        assert torch.allclose(module(x), want, atol=1e-5, rtol=1e-5)
+
+        injection.eject(vdn)
+        # External provider is still live and exact after VDN removal.
+        assert module.forward == external_forward
+        external_only = true_forward(x) + _delta(x, ed, eu, 0.4)
+        assert torch.allclose(module(x), external_only, atol=1e-5, rtol=1e-5)
+    finally:
+        # idempotent VDN stale eject is harmless
+        injection.eject(vdn)
+        external.eject()
+
+    assert module.forward == true_forward
+
+
+def test_cross_provider_external_first(monkeypatch):
+    _run_cross_provider(monkeypatch, external_first=True)
+
+
+def test_cross_provider_vdn_first(monkeypatch):
+    _run_cross_provider(monkeypatch, external_first=False)
+
+
+def test_repeated_pseudo_continuum_chunks_do_not_accumulate(monkeypatch):
+    monkeypatch.setattr(
+        comfy.model_management, "get_torch_device", lambda: torch.device("cpu")
+    )
+    base = _base()
+    module = base.model.diffusion_model.linear
+    true_forward = module.forward
+    down, up = _term(907)
+    x = torch.randn(3, 8)
+    want = true_forward(x) + _delta(x, down, up)
+
+    for chunk in range(12):
+        vdn, _ = _apply(base, down, up, 1.0)
+        injection = vdn.injections["vdn_lora"][0]
+        injection.inject(vdn)
+        try:
+            assert module.forward == true_forward, chunk
+            assert torch.allclose(module(x), want, atol=1e-5), chunk
+        finally:
+            injection.eject(vdn)
+        assert module.forward == true_forward, chunk
+        assert torch.allclose(module(x), true_forward(x), atol=1e-6), chunk

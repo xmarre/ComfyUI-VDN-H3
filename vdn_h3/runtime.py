@@ -12,6 +12,15 @@ scratch is never raced across ModelPatcher clones or threads.
 Branch *weights* do not live here. They remain either bounded streamed checkpoint
 descriptors or a ComfyUI-managed additional ModelPatcher. The only process-global
 runtime object is one bounded worker executor; it owns no model tensors or cache.
+
+Cross-stream ownership is explicit even with ``cudaMallocAsync``. PyTorch's async
+allocator still uses ``record_stream`` to learn about streams other than an
+allocation's creation stream before ``cudaFreeAsync`` can safely recycle storage.
+VDN prefetch allocates on a dedicated producer stream and consumes on the caller's
+stream, so this is exactly the cross-stream case that must be recorded. The warning
+about redundant ``record_stream`` calls under ``cudaMallocAsync`` concerns recording
+the allocation/creation stream itself; it does not make side-stream lifetime
+tracking unnecessary.
 """
 from __future__ import annotations
 
@@ -36,7 +45,6 @@ _ACTIVE_BUFFERS = contextvars.ContextVar("vdn_active_runtime_buffers", default=N
 # each RuntimeBuffers owns at most one Future/result and drops it on reset.
 _PREFETCH_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="vdn-branch-prefetch")
-_RECORD_STREAM_NEEDED = None
 
 
 def current_runtime_buffers():
@@ -53,24 +61,6 @@ def _bounded_put(mapping, key, value, limit):
     return value
 
 
-def _record_stream_needed():
-    """Whether torch's allocator requires explicit record_stream ownership.
-
-    Under cudaMallocAsync the allocator is stream ordered already. record_stream is a
-    no-op there and recent torch versions warn for every call. This mirrors upstream
-    VDN v1.4.3 while keeping the decision in this fork's state-owned prefetch layer.
-    """
-    global _RECORD_STREAM_NEEDED
-    if _RECORD_STREAM_NEEDED is None:
-        try:
-            _RECORD_STREAM_NEEDED = torch.cuda.get_allocator_backend() != "cudaMallocAsync"
-        except Exception:
-            # Older/custom torch builds may not expose the allocator query. Preserve
-            # the conservative caching-allocator behavior in that case.
-            _RECORD_STREAM_NEEDED = True
-    return _RECORD_STREAM_NEEDED
-
-
 class _StreamPrefetcher:
     """One cancellable in-flight block transfer; no per-state worker/thread leak."""
 
@@ -82,8 +72,15 @@ class _StreamPrefetcher:
 
     @staticmethod
     def _record_stream(tensor, stream):
-        if not _record_stream_needed():
-            return
+        """Record the consumer stream for every storage backing a streamed weight.
+
+        Prefetched weights are allocated on a dedicated CUDA stream and later read
+        by the model's current stream. Both PyTorch's native caching allocator and
+        its ``cudaMallocAsync`` allocator require the non-creation usage stream to
+        be recorded so storage cannot be recycled before the consumer finishes.
+        QuantizedTensor wrappers may own several underlying CUDA tensors; record all
+        of them best-effort.
+        """
         seen = [tensor]
         inner = getattr(tensor, "_qdata", None)
         if isinstance(inner, torch.Tensor):

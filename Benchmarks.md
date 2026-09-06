@@ -1,25 +1,31 @@
 # Benchmarks — ComfyUI-VDN-H3
 
-This file preserves historical measurements and defines the measurement contract for the current runtime. **Historical numbers are not performance validation of v1.5.1.**
+This file preserves historical measurements and defines the measurement contract for the current runtime. **Historical numbers are not performance validation of v1.5.2.**
 
-## Current v1.5.1 execution differences
+## Current v1.5.2 execution differences
 
 Compared with the older measurements below:
 
-- `lora_mode=bypass` uses stack-safe activation-side Comfy `BypassForwardHook` adapters for ordinary LoRA targets;
-- the v1.5.0 `add_weight_wrapper()` / `weight_function` adapter path is no longer active;
-- VDN can coexist with another ordinary Comfy runtime-bypass provider on the same module by inserting underneath the existing chain and splicing itself out safely;
+- `lora_mode=bypass` uses one VDN-owned PyTorch forward post-hook per affected module;
+- VDN never replaces or splices `module.forward`, so another Comfy runtime-bypass provider retains independent ownership of its forward chain;
+- the v1.5.0 `add_weight_wrapper()` / `weight_function` adapter path is not active;
+- the v1.5.1 VDN `BypassForwardHook` linked-list/splicing path is not active;
+- all VDN LoRA terms for one module are combined into one exact low-rank residual;
+- runtime adapter factors are staged onto the intended compute device at injection time, before the first H3 forward;
+- projected pruned/curve AdaLN updates stay off the base weight/bias in bypass mode and are applied as an exact projected post-forward residual plus constant bias;
 - fused INT8 `mlp.fc2` targets that do not call `module.forward` remain ordinary Comfy weight patches;
-- full-width curve/pruned AdaLN adapters are projected through the exact pruning affine and applied as native curve weight + bias patches;
-- the old private GPU branch cache is replaced by bounded streaming or a Comfy-managed additional `ModelPatcher`;
-- selected upstream v1.4 performance work is retained under state-owned lifecycle rules: VRAM-aware branch selection, native INT8 ConvRot streaming under pressure, execution-leased retained scratch, and one-block streaming prefetch;
+- merge-mode curve/pruned AdaLN adapters are projected through the exact pruning affine and applied as native curve weight + bias patches;
+- the old private GPU branch cache remains replaced by bounded streaming or a Comfy-managed additional `ModelPatcher`;
+- selected upstream v1.4 performance work remains under state-owned lifecycle rules: VRAM-aware branch selection, native INT8 ConvRot streaming under pressure, execution-leased retained scratch, and one-block streaming prefetch;
+- cross-stream prefetched branch tensors record the model consumer stream under both native and `cudaMallocAsync` allocators;
+- retained VDN local windows use exact SDPA and ignore model-level attention overrides;
 - `auto` placement reserves still-unloaded base-model bytes before assigning VDN residency.
 
-New matched GPU measurements are required before assigning speed or VRAM numbers to v1.5.1.
+The complete stacked RTX PRO 6000 workflow passed the v1.5.2 correctness release gate. New matched GPU measurements are still required before assigning speed or VRAM numbers to v1.5.2.
 
 ## Historical RTX 5090 measurements
 
-These measurements predate the v1.5/v1.5.1 lifecycle work.
+These measurements predate the v1.5-v1.5.2 lifecycle work.
 
 ### Rig
 
@@ -58,11 +64,15 @@ Normal Comfy `ModelPatcher.add_patches()` application. This is the conservative 
 
 ### `lora_mode=bypass`
 
-Ordinary adapter targets keep the resident base parameter untouched and add their low-rank activation delta through Comfy's bypass-hook mechanism. VDN's injection layer is specifically regression-tested with an independent external runtime-bypass provider in both provider insertion orders and across repeated load/unload cycles.
+Ordinary adapter targets keep the resident base parameter untouched. VDN registers a standard PyTorch forward post-hook and adds the exact low-rank residual after the module returns. VDN does not replace `module.forward`, does not enter another provider's `BypassForwardHook` chain, and does not install a Comfy `weight_function` wrapper.
 
-This path preserves the native base forward for quantized/custom layers instead of installing the v1.5.0 `weight_function` wrapper. That distinction matters because a Comfy weight function on quantized H3 can force a copied/dequantized compute-weight path.
+The production history matters for interpreting v1.5.2:
 
-The production reason for the v1.5.1 hotfix was a hard CUDA illegal-address abort in the stacked INT8 ConvRot H3 + VDN bypass + external runtime-DoRA + `cudaMallocAsync` workflow after v1.5.0 introduced runtime weight wrappers. CUDA failure reporting is asynchronous, so that trace does not prove which kernel originally faulted, but the v1.5.0 wrapper path was the new regression boundary and is no longer used.
+- v1.5.0 weight wrappers failed the stacked INT8 ConvRot H3 + external runtime-DoRA + `cudaMallocAsync` workflow;
+- v1.5.1 removed those wrappers but its VDN mutable-forward chain also failed;
+- the first v1.5.2 post-hook candidate still materialized projected curve-AdaLN patches and lazily copied runtime factors in the first hook; the complete real run still failed at the first actual H3 evaluation.
+
+The final v1.5.2 runtime removes both remaining VDN-side boundaries: curve-AdaLN stays non-materialized in bypass mode, and runtime factors are staged before the model forward begins. The corrected production stack completed successfully. CUDA reporting is asynchronous, so none of the historical Python stack locations are treated as proof of a particular originating CUDA kernel.
 
 ## Curve/pruned AdaLN projection
 
@@ -79,9 +89,7 @@ A_pruned   = A @ basis.T
 bias_delta = B @ (A @ mean)
 ```
 
-The constant term is required. v1.5.1 registers the projected native curve weight and bias terms as ordinary Comfy patches in both adapter modes; there is no reconstructed dense timestep MLP and no runtime weight wrapper for these terms.
-
-The affine resolver accepts only the exact pruning basis/mean corresponding to the loaded curve table. A mismatched or unverifiable affine fails closed.
+The constant term is required. In bypass mode the projected low-rank term and constant are applied after `adaln_proj.linear` without modifying its base parameters. In merge mode they remain ordinary Comfy weight/bias patches. The affine resolver accepts only the exact pruning basis/mean corresponding to the loaded curve table; a mismatched or unverifiable affine fails closed.
 
 ## Branch residency
 
@@ -98,7 +106,8 @@ The affine resolver accepts only the exact pruning basis/mean corresponding to t
 
 - resolves branch tensors block-by-block;
 - keeps safetensors mappings bounded to each resolution operation;
-- when retained buffers are enabled on CUDA, uses one-block lookahead prefetch keyed by block/device/dtype.
+- when retained buffers are enabled on CUDA, uses one-block lookahead prefetch keyed by block/device/dtype;
+- waits on the producer event and records the consumer stream on the returned storages before use.
 
 ### `branch_weights=resident`
 
@@ -110,8 +119,6 @@ The affine resolver accepts only the exact pruning basis/mean corresponding to t
 
 `retain_buffers=auto|on|off` controls VDN scratch, not model weights. Retained mode can reuse bounded recurrence, grouped-window, activation-copy and prefetch scratch owned by one `VDNState`. One execution leases the pool; nested/concurrent execution falls back to isolated transient storage.
 
-Under `cudaMallocAsync`, explicit `record_stream` bookkeeping is skipped because the allocator is already stream ordered.
-
 ## Current CI validation
 
 CI validates implementation contracts rather than performance:
@@ -122,11 +129,15 @@ CI validates implementation contracts rather than performance:
 - adapter conversion and checkpoint/model-spec validation;
 - curve/pruned affine projection including the constant bias term;
 - merge-path custom/quantized weight lifecycle tests;
-- stack-safe bypass lifecycle tests across independent providers and repeated cycles;
+- non-mutating post-forward bypass lifecycle tests across independent providers and repeated cycles;
+- projected curve-AdaLN bypass identity without base weight/bias mutation;
 - explicit assertions that active bypass installs no `weight_wrapper_patches`;
+- injection-time runtime-factor staging contract;
+- cross-stream branch-prefetch ownership including quantized backing tensors;
 - retained-vs-transient branch/window numerical identity;
+- exact retained-window SDPA semantics with no attention-override leakage;
 - resource lease/isolation and prefetch placement tests;
 - current ComfyUI-main import/registration smoke;
 - legacy `ApplyVDNH3Advanced` positional-workflow migration.
 
-Real decoded-media output and GPU timing remain separate release evidence, not something inferred from CPU CI.
+Real decoded-media output, full GPU workflow completion, VRAM, and timing remain separate evidence from CPU CI. For v1.5.2, the production workflow completion and decoded-media correctness gate were also passed; no new speed/VRAM benchmark is claimed here.

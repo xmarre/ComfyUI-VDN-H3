@@ -170,7 +170,14 @@ def _build_window_plan(video_start, video_end, num_frames, tokens_per_frame,
 def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
                                    num_frames, tokens_per_frame, bounds, scale,
                                    anchor_frames="none", transformer_options=None):
-    """Grouped exact window softmax with execution-owned plan/KV scratch reuse."""
+    """Grouped exact window softmax with execution-owned plan/KV scratch reuse.
+
+    VDN's released local-window operator is exact SDPA. Model-level attention
+    overrides (Sage/Kitchen/etc.) apply to native/base attention, but must not leak
+    into VDN's trained local-window branch. ``transformer_options`` is accepted for
+    API compatibility only and deliberately ignored here.
+    """
+    del transformer_options
     heads, head_dim = query.shape[1], query.shape[2]
     seq = query.shape[0]
     resources = current_runtime_buffers()
@@ -194,7 +201,7 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
     global_count = global_idx.numel()
     if global_count:
         out[global_idx] = W._sdpa(
-            query[global_idx], key, value, scale, transformer_options)
+            query[global_idx], key, value, scale, None)
 
     groups = plan["groups"]
     if groups:
@@ -222,10 +229,10 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
                 k_scratch[:global_count + window_rows],
                 v_scratch[:global_count + window_rows],
                 scale,
-                transformer_options,
+                None,
             )
 
     for start, stop in plan["anchor_slices"]:
         out[start:stop] = W._sdpa(
-            query[start:stop], key, value, scale, transformer_options)
+            query[start:stop], key, value, scale, None)
     return out

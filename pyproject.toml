@@ -20,8 +20,8 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/xmarre/ComfyUI-VDN-H3"
-Issues = "https://github.com/xmarre/ComfyUI-VDN-H3/issues"
+Repository = "https://github.com/xmarre/ComfyUI-VDN-H3-Plus"
+Issues = "https://github.com/xmarre/ComfyUI-VDN-H3-Plus/issues"
 Upstream = "https://github.com/Saganaki22/ComfyUI-VDN-H3"
 OpenVDN = "https://github.com/OpenVDN/vdn-minimax-h3"
 

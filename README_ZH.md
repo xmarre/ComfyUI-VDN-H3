@@ -1,4 +1,6 @@
-# ComfyUI-VDN-H3 — MiniMax-H3 的 VDN-H3
+# ComfyUI-VDN-H3-Plus — MiniMax-H3 的 VDN-H3
+
+> **Plus 分支：** 这是 `xmarre` 维护的 [Saganaki22/ComfyUI-VDN-H3](https://github.com/Saganaki22/ComfyUI-VDN-H3) Plus 分支。它保留上游项目基础，同时维护可能有意与上游不同的功能、集成和修复。
 
 <img width="1039" height="505" alt="VDN-H3" src="https://github.com/user-attachments/assets/ab4c1691-bff5-46fe-8b3e-635429b0700f" />
 
@@ -30,7 +32,7 @@ Advanced 节点默认 `architecture_mode=checkpoint`。只有显式选择 `overr
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/Saganaki22/ComfyUI-VDN-H3
+git clone https://github.com/xmarre/ComfyUI-VDN-H3-Plus.git ComfyUI-VDN-H3
 ```
 
 保持官方目录结构下载到 `ComfyUI/models/vdn/`：

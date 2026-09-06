@@ -1,4 +1,6 @@
-# ComfyUI-VDN-H3
+# ComfyUI-VDN-H3-Plus
+
+> **Plus fork:** This is the `xmarre` maintained Plus fork of [Saganaki22/ComfyUI-VDN-H3](https://github.com/Saganaki22/ComfyUI-VDN-H3). It preserves the upstream project's foundation while carrying additional features, integrations, fixes, and behavior that may intentionally diverge from upstream.
 
 A ComfyUI port of the released [OpenVDN VDN-H3](https://github.com/OpenVDN/vdn-minimax-h3) hybrid-attention architecture for ComfyUI's native MiniMax-H3 model.
 
@@ -10,7 +12,7 @@ This xmarre fork keeps the released VDN checkpoint/math contract while adding cu
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/xmarre/ComfyUI-VDN-H3.git
+git clone https://github.com/xmarre/ComfyUI-VDN-H3-Plus.git ComfyUI-VDN-H3
 ```
 
 Restart ComfyUI.
@@ -177,6 +179,6 @@ CPU/oracle CI validates numerical and ownership contracts. The complete stacked 
 
 - OpenVDN reference implementation: https://github.com/OpenVDN/vdn-minimax-h3
 - Original ComfyUI port: https://github.com/Saganaki22/ComfyUI-VDN-H3
-- This maintained fork: https://github.com/xmarre/ComfyUI-VDN-H3
+- This maintained fork: https://github.com/xmarre/ComfyUI-VDN-H3-Plus
 
 Repository code is distributed under [Apache-2.0](LICENSE). Third-party model weights and repositories retain their own licenses. See [NOTICE](NOTICE) for attribution details.

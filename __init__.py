@@ -12,11 +12,19 @@ _PKG = os.path.dirname(__file__)
 if _PKG not in sys.path:
     sys.path.insert(0, _PKG)
 
+from vdn_h3.mixed_passthrough import install as _install_mixed_passthrough
 from vdn_h3.compiler_guard import install_layout_guard as _install_layout_guard
+
+# Install the mixed-grid safety policy before node execution creates VDN attention
+# object patches. Flow API-2 calls keep adapter-modified projections but use native
+# MiniMax-H3 attention instead of the untrained heterogeneous-grid VDN gate/branch.
+_install_mixed_passthrough()
+
 from vdn_h3.nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
 _install_layout_guard()
 del _install_layout_guard
+del _install_mixed_passthrough
 
 # Frontend compatibility shim for legacy ApplyVDNH3Advanced positional workflows.
 WEB_DIRECTORY = "./web"

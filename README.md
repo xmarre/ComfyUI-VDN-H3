@@ -37,7 +37,7 @@ Official stages include:
 | `vdn_checkpoint` | Stage directory under `models/vdn/` |
 | `apply_turbo_adapter` | Apply the released Turbo/DMD adapter when the stage provides it |
 | `strength` | Adapter strength; `1.0` is the released setting |
-| `lora_mode` | `merge` or stack-safe runtime `bypass` |
+| `lora_mode` | `merge` or isolated runtime `bypass` |
 | `branch_weights` | `auto`, `stream`, or `resident` |
 | `retain_buffers` | `auto`, `on`, or `off` |
 | `attention_backend` | `grouped` or opt-in `flex` |
@@ -53,31 +53,23 @@ Adds independent Stage-B/Turbo strengths, optional compiled helpers, and explici
 
 ### `lora_mode=merge`
 
-Uses ordinary Comfy `ModelPatcher.add_patches()` weight ownership. This remains the conservative reference path for matched output validation.
+Uses ordinary Comfy `ModelPatcher.add_patches()` weight ownership. This is the conservative reference path for matched output validation.
 
 ### `lora_mode=bypass`
 
-v1.5.1 uses Comfy's activation-side `BypassForwardHook` mechanism for ordinary VDN LoRA targets, with an additional VDN lifecycle layer that makes independently owned runtime adapter providers safe to stack.
+v1.5.2 keeps ordinary VDN LoRA terms off both Comfy weight wrappers and mutable `module.forward` bypass chains. Each affected module receives one VDN-owned PyTorch **forward post-hook**. The normal module forward executes first, including any independently managed provider that chooses to wrap it, and VDN then adds its exact low-rank residual to the returned tensor.
 
-The important properties are:
+The runtime contract is:
 
-- VDN does not assume it is the only runtime-bypass provider on a module;
-- if another Comfy bypass hook is already active, VDN inserts underneath it rather than blindly becoming the outermost owner;
-- teardown can splice VDN out of the middle of the live chain without restoring a stale `module.forward`;
-- the same logic works whether VDN or the external provider was registered first;
-- rerunning Apply VDN replaces the previous live VDN hook set on the clone-shared inner model instead of accumulating another adapter delta;
-- pre-existing cyclic bypass chains fail closed;
-- fused INT8 `mlp.fc2` targets that do not call `module.forward` stay on normal Comfy weight patches.
-
-### Why v1.5.1 changed bypass again
-
-v1.5.0 temporarily implemented bypass with `ModelPatcher.add_weight_wrapper()` / `weight_function` and a managed A/B-factor model. On quantized H3, a weight function changes execution onto Comfy's copied/dequantized compute-weight path.
-
-A production RTX PRO 6000 run combining the INT8 ConvRot H3 base, VDN bypass, a second runtime-bypass DoRA/LoRA provider, `cudaMallocAsync`, Flow Mixed-Grid, Continuum and Spectrum/SA-PECE hard-aborted on the first actual H3 evaluation with a CUDA illegal memory access. The fatal stack was inside the external Comfy bypass-LoRA chain. Because CUDA reporting is asynchronous, the stack does not by itself identify the exact originating kernel, but the v1.5.0 weight-wrapper execution path was the new regression boundary.
-
-The older stack-safe activation-hook implementation had already been validated with the same cross-provider lifecycle, so v1.5.1 restores that proven execution architecture rather than trying to patch around the quantized weight-wrapper interaction.
-
-The v1.5.0 wrapper path is **not** installed by `lora_mode=bypass` in v1.5.1.
+- VDN never replaces, splices, saves, or restores `module.forward`;
+- VDN does not install `ModelPatcher.add_weight_wrapper()` / `weight_function` callbacks;
+- all active VDN terms for one module are combined into one exact low-rank residual;
+- adapter factors are staged onto the intended compute device when the VDN `PatcherInjection` is injected, before the first H3 forward;
+- post-hook handles are generation-owned on the clone-shared inner model;
+- applying a newer VDN clone replaces the previous VDN registration instead of accumulating deltas;
+- ejecting an older/stale clone cannot remove the newer registration;
+- another provider using Comfy `BypassForwardHook` remains outside VDN's ownership and its forward chain is never rewritten by VDN;
+- fused INT8 `mlp.fc2` targets whose H3 fast path bypasses `module.forward` remain ordinary Comfy weight patches.
 
 ## Pruned / curve MiniMax-H3 bases
 
@@ -96,7 +88,12 @@ bias_delta = B @ (A @ mean)
 
 Both terms are required. VDN must resolve the matching `adaln_basis` + `adaln_mean` pair and fails closed rather than guessing or dropping incompatible AdaLN updates.
 
-In v1.5.1, the projected curve weight and constant bias terms use ordinary Comfy weight/bias patches in both adapter modes. They do not use the activation-side VDN hooks and do not use the superseded v1.5.0 weight-wrapper path.
+Ownership depends on adapter mode:
+
+- `merge`: projected curve weight and constant bias use ordinary Comfy weight/bias patches;
+- `bypass`: the exact projected low-rank residual plus constant bias are added by a post-forward hook on `adaln_proj.linear`; the pruned base weight and bias remain untouched.
+
+This distinction matters on quantized/pruned H3. Earlier v1.5.x candidates that materialized the projected AdaLN terms in bypass mode were part of the remaining VDN-specific execution preceding the production CUDA failure boundary. The bypass path now avoids that base-weight mutation entirely.
 
 If a matching BF16 source checkpoint remains beside an INT8 derivative, VDN can read only the small affine tensors from it. Otherwise use:
 
@@ -116,7 +113,11 @@ python tools/extract_h3_adaln_affine.py \
 
 `retain_buffers=on` reuses execution-owned scan/window/activation scratch. The retained pool belongs to one VDN state and is leased for one diffusion-model execution; nested/concurrent runs that cannot acquire it use isolated transient scratch.
 
-Under `cudaMallocAsync`, explicit `record_stream` bookkeeping is skipped because the allocator is already stream ordered. This incorporates upstream v1.4.3's torch-warning fix in this fork's state-owned prefetch implementation.
+### CUDA stream ownership
+
+One-block branch prefetch copies weights on a dedicated CUDA producer stream and consumes them on the model stream. VDN records that consumer stream for every prefetched tensor and for the backing tensors of quantized branch weights under **both** the native allocator and `cudaMallocAsync`.
+
+This intentionally differs from a blanket “skip `record_stream` under `cudaMallocAsync`” rule. PyTorch's async allocator still tracks non-creation usage streams before `cudaFreeAsync`; only redundant same-stream recording is unnecessary.
 
 ## Flow-Aligned Regenerate interoperability
 
@@ -147,24 +148,30 @@ Newly created nodes still default to `architecture_mode="checkpoint"`.
 ## Compatibility notes
 
 - `grouped` is the portable attention backend and remains the default. `flex` is opt-in and falls back to grouped if unavailable.
+- VDN's retained local-window operator uses exact SDPA and deliberately does not inherit model-level `transformer_options` attention overrides such as Sage/Kitchen backends.
 - VDN owns the H3 attention object patch. Another extension that tries to own the same `diffusion_model.blocks.*.attn.forward` target is rejected rather than ambiguously stacked.
-- Runtime LoRA/DoRA providers using Comfy's ordinary `BypassForwardHook` mechanism may coexist with VDN bypass; the cross-provider chain is regression-tested in both insertion orders.
+- Runtime LoRA/DoRA providers using Comfy's ordinary `BypassForwardHook` mechanism may coexist with VDN bypass. VDN does not join or rewrite that provider's forward chain.
 - The AIMDO malloc-graph compatibility guard is scoped only around VDN diffusion-model execution and restores the user's compiler setting afterward.
 - Historical benchmark numbers in [Benchmarks.md](Benchmarks.md) predate the current lifecycle work and are not assigned to this runtime without matched measurement.
 
 ## Validation
 
-v1.5.1 adds explicit regression coverage for:
+v1.5.2 has explicit regression coverage for:
 
-- repeated VDN hook injection/ejection;
-- VDN-first and external-provider-first stacked bypass providers;
-- live VDN replacement while an external runtime provider stays active;
-- cyclic-chain rejection;
-- zero `weight_wrapper_patches` in the active bypass path;
-- projected pruned-AdaLN math through native patches;
+- exact ordinary post-forward LoRA math while `module.forward` remains externally owned;
+- exact projected curve-AdaLN bypass math while the base curve weight/bias remain unchanged;
+- VDN-first and external-provider-first coexistence with a real Comfy `BypassForwardHook`;
+- VDN removal while the external provider remains live;
+- clone-shared VDN replacement and stale-clone eject without accumulation;
+- repeated pseudo-Continuum injection/ejection;
+- injection-time adapter-factor staging;
+- zero `weight_wrapper_patches` and zero VDN mutable-forward wrappers in active bypass mode;
+- custom/quantized-like modules retaining their native weight path;
+- cross-stream prefetch lifetime ownership under native and `cudaMallocAsync` allocators;
+- exact retained-window SDPA semantics with no model-level attention-override leakage;
 - current ComfyUI import/registration and the existing OpenVDN numerical/oracle suite.
 
-The API-2 mixed-grid path remains the VDN contract used by the production Flow-Aligned Regenerate Continuum workflow.
+CPU/oracle CI validates numerical and ownership contracts. The complete stacked RTX PRO 6000 workflow was also re-run on current ComfyUI with the corrected Untwist RoPE configuration and passed the release acceptance gate: no CUDA illegal-memory-access regression and normal artifact-free decoded video quality.
 
 ## Upstream and licensing
 
